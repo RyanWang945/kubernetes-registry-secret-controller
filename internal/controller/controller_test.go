@@ -31,10 +31,9 @@ func TestEventHandlersMapResourcesToNamespaceKeys(t *testing.T) {
 
 	client := fake.NewSimpleClientset()
 	store := &config.Store{}
-	parser := config.NewParser()
 	configData := testConfigData(config.Wildcard, "default,build")
 	configData[config.ExcludeNamespaceKey] = "ignored"
-	snapshot, err := parser.Parse(configData)
+	snapshot, err := config.Parse(configData)
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}

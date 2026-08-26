@@ -24,6 +24,9 @@
 - [x] 将 `Snapshot` 重命名为含义明确的 `ConfigurationSnapshot`。
 - [x] 将 Controller 的 `Options` 重命名为 `ControllerOptions`。
 - [x] 同步设计文档和测试，并通过完整验证。
+- [x] 将无状态配置解析改为 `config.Parse` 包级入口，不在 Controller 中持有 Parser。
+- [x] 明确区分集群资源与固定 ConfigMap 的 Informer Factory 命名和作用域。
+- [ ] 回复全部 PR review comment，保留线程未 resolved 供复查。
 
 ## 后续里程碑：凭证获取与调度
 

@@ -18,8 +18,7 @@ const validRegistries = `
 func TestParserNormalizesSelectorsAndRegistries(t *testing.T) {
 	t.Parallel()
 
-	parser := mustParser(t)
-	snapshot, err := parser.Parse(map[string]string{
+	snapshot, err := Parse(map[string]string{
 		NamespaceKey:        " staging,production,staging ",
 		ExcludeNamespaceKey: " excluded-b,excluded-a,excluded-b ",
 		ServiceAccountKey:   "build, default,build",
@@ -70,10 +69,9 @@ func TestParserNormalizesSelectorsAndRegistries(t *testing.T) {
 func TestParserWildcardAndConfiguredNamespaceExclusions(t *testing.T) {
 	t.Parallel()
 
-	parser := mustParser(t)
 	data := validData(Wildcard, Wildcard)
 	data[ExcludeNamespaceKey] = "kube-system,excluded"
-	snapshot, err := parser.Parse(data)
+	snapshot, err := Parse(data)
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
@@ -90,7 +88,7 @@ func TestParserWildcardAndConfiguredNamespaceExclusions(t *testing.T) {
 		t.Error("ServiceAccounts.Matches(any-valid-name) = false, want true")
 	}
 
-	withoutExclusions, err := parser.Parse(validData(Wildcard, Wildcard))
+	withoutExclusions, err := Parse(validData(Wildcard, Wildcard))
 	if err != nil {
 		t.Fatalf("Parse() without exclusions error = %v", err)
 	}
@@ -100,7 +98,7 @@ func TestParserWildcardAndConfiguredNamespaceExclusions(t *testing.T) {
 
 	namedData := validData("production,staging", "default")
 	namedData[ExcludeNamespaceKey] = "production"
-	named, err := parser.Parse(namedData)
+	named, err := Parse(namedData)
 	if err != nil {
 		t.Fatalf("Parse() named selector with exclusion error = %v", err)
 	}
@@ -177,11 +175,10 @@ func TestParserRejectsInvalidConfiguration(t *testing.T) {
 		},
 	}
 
-	parser := mustParser(t)
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			_, err := parser.Parse(test.data)
+			_, err := Parse(test.data)
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("Parse() error = %v, want an error containing %q", err, test.wantErr)
 			}
@@ -228,11 +225,10 @@ func TestParserRejectsCredentialAndDomainConflicts(t *testing.T) {
 		},
 	}
 
-	parser := mustParser(t)
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			_, err := parser.Parse(map[string]string{
+			_, err := Parse(map[string]string{
 				NamespaceKey:      "production",
 				ServiceAccountKey: "default",
 				RegistriesKey:     test.registries,
@@ -247,8 +243,7 @@ func TestParserRejectsCredentialAndDomainConflicts(t *testing.T) {
 func TestParserOrderDoesNotAffectConfigurationSnapshot(t *testing.T) {
 	t.Parallel()
 
-	parser := mustParser(t)
-	first, err := parser.Parse(map[string]string{
+	first, err := Parse(map[string]string{
 		NamespaceKey:        "production,staging",
 		ExcludeNamespaceKey: "excluded-b,excluded-a",
 		ServiceAccountKey:   "default,build",
@@ -269,7 +264,7 @@ func TestParserOrderDoesNotAffectConfigurationSnapshot(t *testing.T) {
 		t.Fatalf("first Parse() error = %v", err)
 	}
 
-	second, err := parser.Parse(map[string]string{
+	second, err := Parse(map[string]string{
 		NamespaceKey:        "staging,production",
 		ExcludeNamespaceKey: "excluded-a,excluded-b",
 		ServiceAccountKey:   "build,default",
@@ -293,11 +288,6 @@ func TestParserOrderDoesNotAffectConfigurationSnapshot(t *testing.T) {
 	if !first.Equal(second) {
 		t.Fatal("semantically identical configurations are not equal")
 	}
-}
-
-func mustParser(t *testing.T) *Parser {
-	t.Helper()
-	return NewParser()
 }
 
 func validData(namespace, serviceAccount string) map[string]string {

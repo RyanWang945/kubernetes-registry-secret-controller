@@ -74,12 +74,14 @@ type Controller struct {
 	controllerOptions ControllerOptions
 	logger            *slog.Logger
 
-	configParser *config.Parser
-	configStore  *config.Store
-	syncer       NamespaceSyncer
+	configStore *config.Store
+	syncer      NamespaceSyncer
 
-	coreFactory   informers.SharedInformerFactory
-	configFactory informers.SharedInformerFactory
+	// Kubernetes informer options apply to every informer created by one
+	// factory. Separate factories let resource watches stay cluster-scoped while
+	// the ConfigMap watch is restricted to one namespace and one object name.
+	clusterResourceFactory informers.SharedInformerFactory
+	configMapFactory       informers.SharedInformerFactory
 
 	namespaceInformer      coreinformers.NamespaceInformer
 	serviceAccountInformer coreinformers.ServiceAccountInformer
@@ -119,10 +121,8 @@ func New(
 		return nil, fmt.Errorf("invalid controller namespace: %s", strings.Join(problems, "; "))
 	}
 
-	parser := config.NewParser()
-
-	coreFactory := informers.NewSharedInformerFactory(client, 0)
-	configFactory := informers.NewSharedInformerFactoryWithOptions(
+	clusterResourceFactory := informers.NewSharedInformerFactory(client, 0)
+	configMapFactory := informers.NewSharedInformerFactoryWithOptions(
 		client,
 		0,
 		informers.WithNamespace(controllerOptions.ControllerNamespace),
@@ -137,14 +137,13 @@ func New(
 	controller := &Controller{
 		controllerOptions:      controllerOptions,
 		logger:                 controllerOptions.Logger.With("component", "resource-controller"),
-		configParser:           parser,
 		configStore:            configStore,
 		syncer:                 syncer,
-		coreFactory:            coreFactory,
-		configFactory:          configFactory,
-		namespaceInformer:      coreFactory.Core().V1().Namespaces(),
-		serviceAccountInformer: coreFactory.Core().V1().ServiceAccounts(),
-		configMapInformer:      configFactory.Core().V1().ConfigMaps(),
+		clusterResourceFactory: clusterResourceFactory,
+		configMapFactory:       configMapFactory,
+		namespaceInformer:      clusterResourceFactory.Core().V1().Namespaces(),
+		serviceAccountInformer: clusterResourceFactory.Core().V1().ServiceAccounts(),
+		configMapInformer:      configMapFactory.Core().V1().ConfigMaps(),
 		resourceQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: resourceQueueName},
@@ -210,8 +209,8 @@ func (c *Controller) Run(ctx context.Context) error {
 		return errors.New("controller can only be run once")
 	}
 
-	c.coreFactory.Start(ctx.Done())
-	c.configFactory.Start(ctx.Done())
+	c.clusterResourceFactory.Start(ctx.Done())
+	c.configMapFactory.Start(ctx.Done())
 
 	if !cache.WaitForCacheSync(
 		ctx.Done(),
@@ -294,7 +293,7 @@ func (c *Controller) onConfigMapAdd(object any) {
 		return
 	}
 
-	candidate, err := c.configParser.Parse(configMap.Data)
+	candidate, err := config.Parse(configMap.Data)
 	if err != nil {
 		c.logger.Error(
 			"rejected invalid ConfigMap; retaining the last valid configuration",

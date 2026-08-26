@@ -9,14 +9,9 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// Parser validates and normalizes the supported ConfigMap data fields.
-type Parser struct{}
-
-func NewParser() *Parser {
-	return &Parser{}
-}
-
-func (p *Parser) Parse(data map[string]string) (ConfigurationSnapshot, error) {
+// Parse validates and normalizes the supported ConfigMap data fields into an
+// immutable runtime configuration.
+func Parse(data map[string]string) (ConfigurationSnapshot, error) {
 	for key := range data {
 		switch key {
 		case NamespaceKey, ExcludeNamespaceKey, ServiceAccountKey, RegistriesKey:

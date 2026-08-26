@@ -5,8 +5,7 @@ import "testing"
 func TestStoreGenerationsAndDefensiveCopies(t *testing.T) {
 	t.Parallel()
 
-	parser := mustParser(t)
-	first, err := parser.Parse(validData("production", "default"))
+	first, err := Parse(validData("production", "default"))
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
@@ -40,7 +39,7 @@ func TestStoreGenerationsAndDefensiveCopies(t *testing.T) {
 		t.Fatalf("equivalent Apply() = %+v, want unchanged generation 1", equivalent)
 	}
 
-	second, err := parser.Parse(validData("production,staging", "default"))
+	second, err := Parse(validData("production,staging", "default"))
 	if err != nil {
 		t.Fatalf("second Parse() error = %v", err)
 	}
