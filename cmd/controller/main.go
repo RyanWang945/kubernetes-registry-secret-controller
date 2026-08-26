@@ -48,7 +48,7 @@ func run(logger *slog.Logger) error {
 
 	configStore := &config.Store{}
 	syncer := controller.NewLoggingSyncer(logger)
-	resourceController, err := controller.New(client, configStore, syncer, controller.Options{Logger: logger})
+	resourceController, err := controller.New(client, configStore, syncer, controller.ControllerOptions{Logger: logger})
 	if err != nil {
 		return fmt.Errorf("create controller: %w", err)
 	}

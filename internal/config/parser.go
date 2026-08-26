@@ -9,32 +9,19 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-var systemNamespaces = []string{
-	"kube-node-lease",
-	"kube-public",
-	"kube-system",
+// Parser validates and normalizes the supported ConfigMap data fields.
+type Parser struct{}
+
+func NewParser() *Parser {
+	return &Parser{}
 }
 
-// Parser validates and normalizes the three supported ConfigMap data fields.
-type Parser struct {
-	controllerNamespace string
-}
-
-func NewParser(controllerNamespace string) (*Parser, error) {
-	controllerNamespace = strings.TrimSpace(controllerNamespace)
-	if problems := validation.IsDNS1123Label(controllerNamespace); len(problems) > 0 {
-		return nil, fmt.Errorf("invalid controller namespace: %s", strings.Join(problems, "; "))
-	}
-
-	return &Parser{controllerNamespace: controllerNamespace}, nil
-}
-
-func (p *Parser) Parse(data map[string]string) (Snapshot, error) {
+func (p *Parser) Parse(data map[string]string) (ConfigurationSnapshot, error) {
 	for key := range data {
 		switch key {
-		case NamespaceKey, ServiceAccountKey, RegistriesKey:
+		case NamespaceKey, ExcludeNamespaceKey, ServiceAccountKey, RegistriesKey:
 		default:
-			return Snapshot{}, fmt.Errorf("unsupported ConfigMap data key %q", key)
+			return ConfigurationSnapshot{}, fmt.Errorf("unsupported ConfigMap data key %q", key)
 		}
 	}
 
@@ -42,31 +29,39 @@ func (p *Parser) Parse(data map[string]string) (Snapshot, error) {
 		data[NamespaceKey],
 		"namespace",
 		validation.IsDNS1123Label,
-		append(append([]string(nil), systemNamespaces...), p.controllerNamespace),
 	)
 	if err != nil {
-		return Snapshot{}, err
+		return ConfigurationSnapshot{}, err
+	}
+
+	excludedNamespaces, err := parseOptionalNameList(
+		data[ExcludeNamespaceKey],
+		"excludeNamespace",
+		validation.IsDNS1123Label,
+	)
+	if err != nil {
+		return ConfigurationSnapshot{}, err
 	}
 
 	serviceAccounts, err := parseNameSelector(
 		data[ServiceAccountKey],
 		"serviceaccount",
 		validation.IsDNS1123Subdomain,
-		nil,
 	)
 	if err != nil {
-		return Snapshot{}, err
+		return ConfigurationSnapshot{}, err
 	}
 
 	registries, err := parseRegistries(data[RegistriesKey])
 	if err != nil {
-		return Snapshot{}, err
+		return ConfigurationSnapshot{}, err
 	}
 
-	return Snapshot{
-		Namespaces:      namespaces,
-		ServiceAccounts: serviceAccounts,
-		Registries:      registries,
+	return ConfigurationSnapshot{
+		Namespaces:         namespaces,
+		ExcludedNamespaces: excludedNamespaces,
+		ServiceAccounts:    serviceAccounts,
+		Registries:         registries,
 	}, nil
 }
 
@@ -74,47 +69,55 @@ func parseNameSelector(
 	raw string,
 	field string,
 	validate func(string) []string,
-	excluded []string,
 ) (NameSelector, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return NameSelector{}, fmt.Errorf("%s must not be empty", field)
 	}
 
+	values, err := parseNameList(raw, field, validate, true)
+	if err != nil {
+		return NameSelector{}, err
+	}
+
+	if containsSorted(values, Wildcard) {
+		if len(values) != 1 {
+			return NameSelector{}, fmt.Errorf("%s wildcard %q cannot be combined with explicit names", field, Wildcard)
+		}
+		return NameSelector{MatchAll: true}, nil
+	}
+
+	return NameSelector{Names: values}, nil
+}
+
+func parseOptionalNameList(raw, field string, validate func(string) []string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	return parseNameList(raw, field, validate, false)
+}
+
+func parseNameList(
+	raw string,
+	field string,
+	validate func(string) []string,
+	allowWildcard bool,
+) ([]string, error) {
 	parts := strings.Split(raw, ",")
-	seen := make(map[string]struct{}, len(parts))
 	values := make([]string, 0, len(parts))
 	for _, part := range parts {
 		name := strings.TrimSpace(part)
 		if name == "" {
-			return NameSelector{}, fmt.Errorf("%s contains an empty name", field)
+			return nil, fmt.Errorf("%s contains an empty name", field)
 		}
-		if _, exists := seen[name]; exists {
-			continue
+		if name != Wildcard || !allowWildcard {
+			if problems := validate(name); len(problems) > 0 {
+				return nil, fmt.Errorf("invalid %s name %q: %s", field, name, strings.Join(problems, "; "))
+			}
 		}
-		seen[name] = struct{}{}
 		values = append(values, name)
 	}
-
-	if _, all := seen["all"]; all {
-		if len(values) != 1 {
-			return NameSelector{}, fmt.Errorf("%s value all cannot be combined with explicit names", field)
-		}
-
-		return NameSelector{
-			All:      true,
-			Excluded: sortedUnique(excluded),
-		}, nil
-	}
-
-	for _, name := range values {
-		if problems := validate(name); len(problems) > 0 {
-			return NameSelector{}, fmt.Errorf("invalid %s name %q: %s", field, name, strings.Join(problems, "; "))
-		}
-	}
-	sort.Strings(values)
-
-	return NameSelector{Names: values}, nil
+	return sortedUnique(values), nil
 }
 
 func parseRegistries(raw string) (map[RegistryKey]RegistryConfig, error) {

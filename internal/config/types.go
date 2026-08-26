@@ -6,9 +6,11 @@ import (
 )
 
 const (
-	NamespaceKey      = "namespace"
-	ServiceAccountKey = "serviceaccount"
-	RegistriesKey     = "registries"
+	NamespaceKey        = "namespace"
+	ExcludeNamespaceKey = "excludeNamespace"
+	ServiceAccountKey   = "serviceaccount"
+	RegistriesKey       = "registries"
+	Wildcard            = "*"
 )
 
 // RegistryKey is the stable, cluster-wide identity of one ACR registry.
@@ -35,17 +37,16 @@ func (r RegistryConfig) Key() RegistryKey {
 	return RegistryKey{RegionID: r.RegionID, InstanceID: r.InstanceID}
 }
 
-// NameSelector represents either all names (minus Excluded) or an explicit,
-// sorted set of names. Values are immutable after parsing.
+// NameSelector represents either every name or an explicit sorted set of
+// names. Values are immutable after parsing.
 type NameSelector struct {
-	All      bool
+	MatchAll bool
 	Names    []string
-	Excluded []string
 }
 
 func (s NameSelector) Matches(name string) bool {
-	if s.All {
-		return !containsSorted(s.Excluded, name)
+	if s.MatchAll {
+		return true
 	}
 	return containsSorted(s.Names, name)
 }
@@ -55,28 +56,36 @@ func containsSorted(values []string, value string) bool {
 	return index < len(values) && values[index] == value
 }
 
-// Snapshot is a complete, normalized and immutable runtime configuration.
-// Generation is assigned by Store and only changes for semantic updates.
-type Snapshot struct {
-	Generation      uint64
-	Namespaces      NameSelector
-	ServiceAccounts NameSelector
-	Registries      map[RegistryKey]RegistryConfig
+// ConfigurationSnapshot is a complete, normalized and immutable runtime
+// configuration. Generation is assigned by Store and only changes for
+// semantic updates.
+type ConfigurationSnapshot struct {
+	Generation         uint64
+	Namespaces         NameSelector
+	ExcludedNamespaces []string
+	ServiceAccounts    NameSelector
+	Registries         map[RegistryKey]RegistryConfig
 }
 
 // Equal reports semantic equality and intentionally ignores Generation.
-func (s Snapshot) Equal(other Snapshot) bool {
+func (s ConfigurationSnapshot) Equal(other ConfigurationSnapshot) bool {
 	return reflect.DeepEqual(s.Namespaces, other.Namespaces) &&
+		reflect.DeepEqual(s.ExcludedNamespaces, other.ExcludedNamespaces) &&
 		reflect.DeepEqual(s.ServiceAccounts, other.ServiceAccounts) &&
 		reflect.DeepEqual(s.Registries, other.Registries)
 }
 
-func (s Snapshot) Clone() Snapshot {
-	clone := Snapshot{
-		Generation:      s.Generation,
-		Namespaces:      cloneSelector(s.Namespaces),
-		ServiceAccounts: cloneSelector(s.ServiceAccounts),
-		Registries:      make(map[RegistryKey]RegistryConfig, len(s.Registries)),
+func (s ConfigurationSnapshot) MatchesNamespace(name string) bool {
+	return s.Namespaces.Matches(name) && !containsSorted(s.ExcludedNamespaces, name)
+}
+
+func (s ConfigurationSnapshot) Clone() ConfigurationSnapshot {
+	clone := ConfigurationSnapshot{
+		Generation:         s.Generation,
+		Namespaces:         cloneSelector(s.Namespaces),
+		ExcludedNamespaces: append([]string(nil), s.ExcludedNamespaces...),
+		ServiceAccounts:    cloneSelector(s.ServiceAccounts),
+		Registries:         make(map[RegistryKey]RegistryConfig, len(s.Registries)),
 	}
 
 	for key, registry := range s.Registries {
@@ -89,8 +98,7 @@ func (s Snapshot) Clone() Snapshot {
 
 func cloneSelector(selector NameSelector) NameSelector {
 	return NameSelector{
-		All:      selector.All,
+		MatchAll: selector.MatchAll,
 		Names:    append([]string(nil), selector.Names...),
-		Excluded: append([]string(nil), selector.Excluded...),
 	}
 }

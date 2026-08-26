@@ -5,19 +5,19 @@ import "sync"
 // Store owns the last valid immutable configuration snapshot.
 type Store struct {
 	mu      sync.RWMutex
-	current *Snapshot
+	current *ConfigurationSnapshot
 }
 
 type ApplyResult struct {
-	Previous    Snapshot
-	Current     Snapshot
+	Previous    ConfigurationSnapshot
+	Current     ConfigurationSnapshot
 	HadPrevious bool
 	Changed     bool
 }
 
 // Apply atomically installs a semantically new snapshot. Equivalent updates do
 // not advance Generation.
-func (s *Store) Apply(candidate Snapshot) ApplyResult {
+func (s *Store) Apply(candidate ConfigurationSnapshot) ApplyResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -45,11 +45,11 @@ func (s *Store) Apply(candidate Snapshot) ApplyResult {
 	return result
 }
 
-func (s *Store) Load() (Snapshot, bool) {
+func (s *Store) Load() (ConfigurationSnapshot, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.current == nil {
-		return Snapshot{}, false
+		return ConfigurationSnapshot{}, false
 	}
 	return s.current.Clone(), true
 }

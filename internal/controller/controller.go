@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -12,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -42,14 +44,14 @@ func (f NamespaceSyncFunc) SyncNamespace(ctx context.Context, namespace string) 
 	return f(ctx, namespace)
 }
 
-type Options struct {
+type ControllerOptions struct {
 	ControllerNamespace string
 	ConfigMapName       string
 	ResourceWorkers     int
 	Logger              *slog.Logger
 }
 
-func (o Options) withDefaults() Options {
+func (o ControllerOptions) withDefaults() ControllerOptions {
 	if o.ControllerNamespace == "" {
 		o.ControllerNamespace = DefaultControllerNamespace
 	}
@@ -69,8 +71,8 @@ func (o Options) withDefaults() Options {
 // It is safe to construct before the fixed ConfigMap exists; a later valid Add
 // event starts reconciliation without restarting the process.
 type Controller struct {
-	options Options
-	logger  *slog.Logger
+	controllerOptions ControllerOptions
+	logger            *slog.Logger
 
 	configParser *config.Parser
 	configStore  *config.Store
@@ -97,7 +99,7 @@ func New(
 	client kubernetes.Interface,
 	configStore *config.Store,
 	syncer NamespaceSyncer,
-	options Options,
+	controllerOptions ControllerOptions,
 ) (*Controller, error) {
 	if client == nil {
 		return nil, errors.New("kubernetes client must not be nil")
@@ -109,32 +111,32 @@ func New(
 		return nil, errors.New("namespace syncer must not be nil")
 	}
 
-	options = options.withDefaults()
-	if options.ResourceWorkers < 1 {
-		return nil, fmt.Errorf("resource workers must be at least one, got %d", options.ResourceWorkers)
+	controllerOptions = controllerOptions.withDefaults()
+	if controllerOptions.ResourceWorkers < 1 {
+		return nil, fmt.Errorf("resource workers must be at least one, got %d", controllerOptions.ResourceWorkers)
+	}
+	if problems := validation.IsDNS1123Label(controllerOptions.ControllerNamespace); len(problems) > 0 {
+		return nil, fmt.Errorf("invalid controller namespace: %s", strings.Join(problems, "; "))
 	}
 
-	parser, err := config.NewParser(options.ControllerNamespace)
-	if err != nil {
-		return nil, err
-	}
+	parser := config.NewParser()
 
 	coreFactory := informers.NewSharedInformerFactory(client, 0)
 	configFactory := informers.NewSharedInformerFactoryWithOptions(
 		client,
 		0,
-		informers.WithNamespace(options.ControllerNamespace),
+		informers.WithNamespace(controllerOptions.ControllerNamespace),
 		informers.WithTweakListOptions(func(listOptions *metav1.ListOptions) {
 			listOptions.FieldSelector = fields.OneTermEqualSelector(
 				"metadata.name",
-				options.ConfigMapName,
+				controllerOptions.ConfigMapName,
 			).String()
 		}),
 	)
 
 	controller := &Controller{
-		options:                options,
-		logger:                 options.Logger.With("component", "resource-controller"),
+		controllerOptions:      controllerOptions,
+		logger:                 controllerOptions.Logger.With("component", "resource-controller"),
 		configParser:           parser,
 		configStore:            configStore,
 		syncer:                 syncer,
@@ -236,11 +238,11 @@ func (c *Controller) Run(ctx context.Context) error {
 	}
 
 	c.enqueueCurrentTargets()
-	c.logger.Info("starting resource workers", "workers", c.options.ResourceWorkers)
+	c.logger.Info("starting resource workers", "workers", c.controllerOptions.ResourceWorkers)
 
 	var workers sync.WaitGroup
-	workers.Add(c.options.ResourceWorkers)
-	for workerID := range c.options.ResourceWorkers {
+	workers.Add(c.controllerOptions.ResourceWorkers)
+	for workerID := range c.controllerOptions.ResourceWorkers {
 		go func() {
 			defer workers.Done()
 			c.runResourceWorker(ctx, workerID)
@@ -288,7 +290,7 @@ func (c *Controller) processNextResource(ctx context.Context) bool {
 
 func (c *Controller) onConfigMapAdd(object any) {
 	configMap, ok := object.(*corev1.ConfigMap)
-	if !ok || configMap.Namespace != c.options.ControllerNamespace || configMap.Name != c.options.ConfigMapName {
+	if !ok || configMap.Namespace != c.controllerOptions.ControllerNamespace || configMap.Name != c.controllerOptions.ConfigMapName {
 		return
 	}
 
@@ -329,7 +331,7 @@ func (c *Controller) onConfigMapAdd(object any) {
 
 func (c *Controller) onConfigMapDelete(object any) {
 	configMap, ok := deletedConfigMap(object)
-	if !ok || configMap.Namespace != c.options.ControllerNamespace || configMap.Name != c.options.ConfigMapName {
+	if !ok || configMap.Namespace != c.controllerOptions.ControllerNamespace || configMap.Name != c.controllerOptions.ConfigMapName {
 		return
 	}
 
@@ -346,7 +348,7 @@ func (c *Controller) onNamespaceAdd(object any) {
 		return
 	}
 	snapshot, loaded := c.configStore.Load()
-	if loaded && snapshot.Namespaces.Matches(namespace.Name) {
+	if loaded && snapshot.MatchesNamespace(namespace.Name) {
 		c.EnqueueNamespace(namespace.Name)
 	}
 }
@@ -357,7 +359,7 @@ func (c *Controller) onServiceAccountChange(object any) {
 		return
 	}
 	snapshot, loaded := c.configStore.Load()
-	if !loaded || !snapshot.Namespaces.Matches(serviceAccount.Namespace) {
+	if !loaded || !snapshot.MatchesNamespace(serviceAccount.Namespace) {
 		return
 	}
 	if snapshot.ServiceAccounts.Matches(serviceAccount.Name) {
@@ -372,14 +374,14 @@ func (c *Controller) enqueueCurrentTargets() {
 		return
 	}
 	c.enqueueNamespacesMatching(func(namespace string) bool {
-		return snapshot.Namespaces.Matches(namespace)
+		return snapshot.MatchesNamespace(namespace)
 	})
 }
 
 func (c *Controller) enqueueAffectedNamespaces(result config.ApplyResult) {
 	c.enqueueNamespacesMatching(func(namespace string) bool {
-		return result.Current.Namespaces.Matches(namespace) ||
-			(result.HadPrevious && result.Previous.Namespaces.Matches(namespace))
+		return result.Current.MatchesNamespace(namespace) ||
+			(result.HadPrevious && result.Previous.MatchesNamespace(namespace))
 	})
 }
 

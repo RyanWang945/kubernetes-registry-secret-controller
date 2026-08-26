@@ -17,6 +17,14 @@
 - [x] 编写 envtest 集成测试，验证真实 API Server 的初始 List 和持续 Watch。
 - [x] 通过 `gofmt`、`go test`、`go test -race`、`go vet` 和 envtest 验证。
 
+## PR #1 Review 修订
+
+- [x] 使用 `"*"` 作为 Namespace 和 ServiceAccount 的全部匹配通配符。
+- [x] 增加可选 `excludeNamespace`，默认不排除任何 Namespace。
+- [x] 将 `Snapshot` 重命名为含义明确的 `ConfigurationSnapshot`。
+- [x] 将 Controller 的 `Options` 重命名为 `ControllerOptions`。
+- [x] 同步设计文档和测试，并通过完整验证。
+
 ## 后续里程碑：凭证获取与调度
 
 - [ ] 定义 TokenProvider、Credential Store 和可注入 Clock。

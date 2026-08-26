@@ -23,12 +23,15 @@ func TestStoreGenerationsAndDefensiveCopies(t *testing.T) {
 	registry.Domains[0] = "mutated.example.com"
 	mutated.Registries[key] = registry
 	mutated.Namespaces.Names = append(mutated.Namespaces.Names, "mutated")
+	mutated.ExcludedNamespaces = append(mutated.ExcludedNamespaces, "production")
 
 	loaded, ok := store.Load()
 	if !ok {
 		t.Fatal("Load() returned no snapshot")
 	}
-	if loaded.Registries[key].Domains[0] == "mutated.example.com" || loaded.Namespaces.Matches("mutated") {
+	if loaded.Registries[key].Domains[0] == "mutated.example.com" ||
+		loaded.Namespaces.Matches("mutated") ||
+		!loaded.MatchesNamespace("production") {
 		t.Fatal("caller mutation changed the stored snapshot")
 	}
 

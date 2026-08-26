@@ -66,7 +66,7 @@ func TestControllerEnvtestInitialListAndContinuousWatch(t *testing.T) {
 
 	store := &config.Store{}
 	recorder := newRecordingSyncer(nil)
-	resourceController, err := New(client, store, recorder, Options{Logger: testLogger()})
+	resourceController, err := New(client, store, recorder, ControllerOptions{Logger: testLogger()})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -137,7 +137,7 @@ func TestControllerEnvtestInitialListAndContinuousWatch(t *testing.T) {
 	}
 	waitForConfigMapResourceVersion(t, resourceController, invalidUpdate.ResourceVersion)
 	unchanged, ok := store.Load()
-	if !ok || unchanged.Generation != 1 || !unchanged.Namespaces.Matches("staging") {
+	if !ok || unchanged.Generation != 1 || !unchanged.MatchesNamespace("staging") {
 		t.Fatalf("invalid update replaced the last valid snapshot: %+v, present = %v", unchanged, ok)
 	}
 
@@ -160,7 +160,7 @@ func TestControllerEnvtestInitialListAndContinuousWatch(t *testing.T) {
 	waitForConfigMapResourceVersion(t, resourceController, validUpdate.ResourceVersion)
 	eventually(t, 5*time.Second, func() bool {
 		snapshot, ok := store.Load()
-		return ok && snapshot.Generation == 2 && snapshot.Namespaces.Matches("future")
+		return ok && snapshot.Generation == 2 && snapshot.MatchesNamespace("future")
 	}, "valid ConfigMap Watch update did not install generation 2")
 	recorder.waitForCount(t, "future", 1)
 
@@ -177,7 +177,7 @@ func TestControllerEnvtestInitialListAndContinuousWatch(t *testing.T) {
 	}, "ConfigMap delete Watch event was not reflected in the informer cache")
 
 	afterDelete, ok := store.Load()
-	if !ok || afterDelete.Generation != 2 || !afterDelete.Namespaces.Matches("future") {
+	if !ok || afterDelete.Generation != 2 || !afterDelete.MatchesNamespace("future") {
 		t.Fatalf("ConfigMap deletion removed the last valid snapshot: %+v, present = %v", afterDelete, ok)
 	}
 }

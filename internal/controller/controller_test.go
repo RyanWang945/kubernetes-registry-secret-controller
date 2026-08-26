@@ -31,11 +31,10 @@ func TestEventHandlersMapResourcesToNamespaceKeys(t *testing.T) {
 
 	client := fake.NewSimpleClientset()
 	store := &config.Store{}
-	parser, err := config.NewParser(DefaultControllerNamespace)
-	if err != nil {
-		t.Fatalf("NewParser() error = %v", err)
-	}
-	snapshot, err := parser.Parse(testConfigData("production", "default,build"))
+	parser := config.NewParser()
+	configData := testConfigData(config.Wildcard, "default,build")
+	configData[config.ExcludeNamespaceKey] = "ignored"
+	snapshot, err := parser.Parse(configData)
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
@@ -114,7 +113,7 @@ func TestConfigMapUpdatesAreAtomicAndDeletionRetainsConfiguration(t *testing.T) 
 	changed.Data[config.NamespaceKey] = "production,staging"
 	resourceController.onConfigMapAdd(changed)
 	second, _ := store.Load()
-	if second.Generation != 2 || !second.Namespaces.Matches("staging") {
+	if second.Generation != 2 || !second.MatchesNamespace("staging") {
 		t.Fatalf("valid update snapshot = %+v, want generation 2 targeting staging", second)
 	}
 }
@@ -225,7 +224,7 @@ func TestControllerWaitsForValidConfigAndRetriesSync(t *testing.T) {
 	}
 }
 
-func TestConfigMapDeleteWatchRetainsLastValidSnapshot(t *testing.T) {
+func TestConfigMapDeleteWatchRetainsLastValidConfiguration(t *testing.T) {
 	t.Parallel()
 
 	configMap := testConfigMap("production", "default")
@@ -268,7 +267,7 @@ func TestConfigMapDeleteWatchRetainsLastValidSnapshot(t *testing.T) {
 	}, "ConfigMap delete was not observed by the informer")
 
 	snapshot, ok := store.Load()
-	if !ok || snapshot.Generation != 1 || !snapshot.Namespaces.Matches("production") {
+	if !ok || snapshot.Generation != 1 || !snapshot.MatchesNamespace("production") {
 		t.Fatalf("snapshot after ConfigMap deletion = %+v, present = %v", snapshot, ok)
 	}
 }
@@ -280,7 +279,7 @@ func newTestController(
 	syncer NamespaceSyncer,
 ) *Controller {
 	t.Helper()
-	resourceController, err := New(client, store, syncer, Options{Logger: testLogger()})
+	resourceController, err := New(client, store, syncer, ControllerOptions{Logger: testLogger()})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

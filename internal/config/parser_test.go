@@ -20,8 +20,9 @@ func TestParserNormalizesSelectorsAndRegistries(t *testing.T) {
 
 	parser := mustParser(t)
 	snapshot, err := parser.Parse(map[string]string{
-		NamespaceKey:      " staging,production,staging ",
-		ServiceAccountKey: "build, default,build",
+		NamespaceKey:        " staging,production,staging ",
+		ExcludeNamespaceKey: " excluded-b,excluded-a,excluded-b ",
+		ServiceAccountKey:   "build, default,build",
 		RegistriesKey: `
 - regionID: cn-hangzhou
   instanceID: cri-aaaaaaaa
@@ -48,6 +49,9 @@ func TestParserNormalizesSelectorsAndRegistries(t *testing.T) {
 	if got, want := snapshot.ServiceAccounts.Names, []string{"build", "default"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("service account names = %v, want %v", got, want)
 	}
+	if got, want := snapshot.ExcludedNamespaces, []string{"excluded-a", "excluded-b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("excluded namespace names = %v, want %v", got, want)
+	}
 
 	key := RegistryKey{RegionID: "cn-hangzhou", InstanceID: "cri-aaaaaaaa"}
 	registry, exists := snapshot.Registries[key]
@@ -63,25 +67,45 @@ func TestParserNormalizesSelectorsAndRegistries(t *testing.T) {
 	}
 }
 
-func TestParserAllNamespaceExclusions(t *testing.T) {
+func TestParserWildcardAndConfiguredNamespaceExclusions(t *testing.T) {
 	t.Parallel()
 
 	parser := mustParser(t)
-	snapshot, err := parser.Parse(validData("all", "all"))
+	data := validData(Wildcard, Wildcard)
+	data[ExcludeNamespaceKey] = "kube-system,excluded"
+	snapshot, err := parser.Parse(data)
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
 
-	for _, namespace := range []string{"kube-system", "kube-public", "kube-node-lease", "registry-secret-controller-system"} {
-		if snapshot.Namespaces.Matches(namespace) {
-			t.Errorf("Namespaces.Matches(%q) = true, want false", namespace)
+	for _, namespace := range []string{"kube-system", "excluded"} {
+		if snapshot.MatchesNamespace(namespace) {
+			t.Errorf("MatchesNamespace(%q) = true, want false", namespace)
 		}
 	}
-	if !snapshot.Namespaces.Matches("production") {
-		t.Error("Namespaces.Matches(production) = false, want true")
+	if !snapshot.MatchesNamespace("production") {
+		t.Error("MatchesNamespace(production) = false, want true")
 	}
 	if !snapshot.ServiceAccounts.Matches("any-valid-name") {
 		t.Error("ServiceAccounts.Matches(any-valid-name) = false, want true")
+	}
+
+	withoutExclusions, err := parser.Parse(validData(Wildcard, Wildcard))
+	if err != nil {
+		t.Fatalf("Parse() without exclusions error = %v", err)
+	}
+	if !withoutExclusions.MatchesNamespace("kube-system") {
+		t.Error("MatchesNamespace(kube-system) = false without excludeNamespace, want true")
+	}
+
+	namedData := validData("production,staging", "default")
+	namedData[ExcludeNamespaceKey] = "production"
+	named, err := parser.Parse(namedData)
+	if err != nil {
+		t.Fatalf("Parse() named selector with exclusion error = %v", err)
+	}
+	if named.MatchesNamespace("production") || !named.MatchesNamespace("staging") {
+		t.Errorf("named MatchesNamespace(): production = %v, staging = %v; exclusion must take precedence", named.MatchesNamespace("production"), named.MatchesNamespace("staging"))
 	}
 }
 
@@ -96,9 +120,9 @@ func TestParserRejectsInvalidConfiguration(t *testing.T) {
 			data:    validData("", "default"),
 			wantErr: "namespace must not be empty",
 		},
-		"all mixed with a name": {
-			data:    validData("all,production", "default"),
-			wantErr: "all cannot be combined",
+		"wildcard mixed with a name": {
+			data:    validData("*,production", "default"),
+			wantErr: "wildcard \"*\" cannot be combined",
 		},
 		"empty list item": {
 			data:    validData("production,,staging", "default"),
@@ -107,6 +131,14 @@ func TestParserRejectsInvalidConfiguration(t *testing.T) {
 		"invalid service account": {
 			data:    validData("production", "Not_Valid"),
 			wantErr: "invalid serviceaccount name",
+		},
+		"wildcard excluded namespace": {
+			data: func() map[string]string {
+				data := validData("production", "default")
+				data[ExcludeNamespaceKey] = Wildcard
+				return data
+			}(),
+			wantErr: "invalid excludeNamespace name",
 		},
 		"unknown registry field": {
 			data: map[string]string{
@@ -212,13 +244,14 @@ func TestParserRejectsCredentialAndDomainConflicts(t *testing.T) {
 	}
 }
 
-func TestParserOrderDoesNotAffectSnapshot(t *testing.T) {
+func TestParserOrderDoesNotAffectConfigurationSnapshot(t *testing.T) {
 	t.Parallel()
 
 	parser := mustParser(t)
 	first, err := parser.Parse(map[string]string{
-		NamespaceKey:      "production,staging",
-		ServiceAccountKey: "default,build",
+		NamespaceKey:        "production,staging",
+		ExcludeNamespaceKey: "excluded-b,excluded-a",
+		ServiceAccountKey:   "default,build",
 		RegistriesKey: `
 - regionID: cn-hangzhou
   instanceID: cri-a
@@ -237,8 +270,9 @@ func TestParserOrderDoesNotAffectSnapshot(t *testing.T) {
 	}
 
 	second, err := parser.Parse(map[string]string{
-		NamespaceKey:      "staging,production",
-		ServiceAccountKey: "build,default",
+		NamespaceKey:        "staging,production",
+		ExcludeNamespaceKey: "excluded-a,excluded-b",
+		ServiceAccountKey:   "build,default",
 		RegistriesKey: `
 - regionID: cn-shanghai
   instanceID: cri-b
@@ -263,11 +297,7 @@ func TestParserOrderDoesNotAffectSnapshot(t *testing.T) {
 
 func mustParser(t *testing.T) *Parser {
 	t.Helper()
-	parser, err := NewParser("registry-secret-controller-system")
-	if err != nil {
-		t.Fatalf("NewParser() error = %v", err)
-	}
-	return parser
+	return NewParser()
 }
 
 func validData(namespace, serviceAccount string) map[string]string {

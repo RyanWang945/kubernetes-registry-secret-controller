@@ -250,7 +250,8 @@ metadata:
   name: registry-secret-controller-config
   namespace: registry-secret-controller-system
 data:
-  namespace: "all"
+  namespace: "*"
+  excludeNamespace: "kube-system,kube-public,kube-node-lease,registry-secret-controller-system"
   serviceaccount: "default"
 
   registries: |
@@ -279,7 +280,7 @@ Worker 数量等内部配置。
 namespace 支持：
 
 ~~~yaml
-namespace: "all"
+namespace: "*"
 ~~~
 
 或者英文逗号分隔的明确名称：
@@ -292,15 +293,30 @@ namespace: "production,staging"
 
 - 去除每项前后空格；
 - 去重；
-- all 不能和其他名称混用；
+- 通配符 `*` 不能和其他名称混用；
 - 空值或非法 Namespace 名称使新配置无效；
-- all 模式默认排除 kube-system、kube-public、kube-node-lease 和
-  registry-secret-controller-system；
+- `*` 模式匹配所有未被 excludeNamespace 排除的 Namespace；
 - Named 模式只处理明确列出的 Namespace。
 
 一期不支持 Namespace Label Selector。
 
-### 5.3 serviceaccount
+### 5.3 excludeNamespace
+
+excludeNamespace 是可选的英文逗号分隔 Namespace 列表，例如：
+
+~~~yaml
+excludeNamespace: "kube-system,kube-public,kube-node-lease"
+~~~
+
+解析规则：
+
+- 未配置或值为空时不排除任何 Namespace；
+- 去除每项前后空格，去重并排序；
+- 每项必须是合法的 Namespace 名称，不支持通配符；
+- 排除规则优先于 namespace 的通配符或明确名称；
+- Controller 不内置任何默认排除项，Controller 自身所在 Namespace 也仅在用户明确配置时排除。
+
+### 5.4 serviceaccount
 
 serviceaccount 支持：
 
@@ -317,12 +333,12 @@ serviceaccount: "default,build"
 或者：
 
 ~~~yaml
-serviceaccount: "all"
+serviceaccount: "*"
 ~~~
 
-解析、去重和 all 互斥规则与 namespace 相同。
+解析、去重和通配符互斥规则与 namespace 相同。
 
-### 5.4 Registry 节点
+### 5.5 Registry 节点
 
 registries 是 RegistryConfig 数组：
 
@@ -345,7 +361,7 @@ type RegistryConfig struct {
 - Domain 统一转成小写，去除末尾点，去重并排序；
 - 同一个 Domain 不能属于不同 RegistryKey。
 
-### 5.5 重复 Registry 合并
+### 5.6 重复 Registry 合并
 
 Config Loader 按 RegistryKey 分组：
 
@@ -361,7 +377,7 @@ Config Loader 按 RegistryKey 分组：
 map[RegistryKey]RegistryConfig
 ~~~
 
-### 5.6 固定运行参数
+### 5.7 固定运行参数
 
 一期不在 ConfigMap 中暴露以下参数：
 
@@ -882,7 +898,8 @@ Kubernetes 资源同步结果。
 
 配置：
 
-- namespace 和 serviceaccount 的 all、逗号列表、去重和非法值；
+- namespace 和 serviceaccount 的 `*`、逗号列表、去重和非法值；
+- excludeNamespace 的默认空值、排除优先级、去重和非法值；
 - Registry 数组解析；
 - RegistryKey 生成；
 - 重复实例且 AK/SK 相同的 Domain 合并；
