@@ -1,0 +1,5 @@
+/bin/
+/.cache/
+/.idea/
+*.test
+coverage.out
