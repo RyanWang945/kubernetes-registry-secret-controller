@@ -12,8 +12,8 @@ func TestStoreGenerationsAndDefensiveCopies(t *testing.T) {
 
 	store := &Store{}
 	result := store.Apply(first)
-	if !result.Changed || result.HadPrevious || result.Current.Generation != 1 {
-		t.Fatalf("first Apply() = %+v, want changed generation 1 without previous", result)
+	if !result.Changed || result.Current.Generation != 1 {
+		t.Fatalf("first Apply() = %+v, want changed generation 1", result)
 	}
 
 	key := RegistryKey{RegionID: "cn-hangzhou", InstanceID: "cri-aaaaaaaa"}
@@ -44,7 +44,7 @@ func TestStoreGenerationsAndDefensiveCopies(t *testing.T) {
 		t.Fatalf("second Parse() error = %v", err)
 	}
 	changed := store.Apply(second)
-	if !changed.Changed || !changed.HadPrevious || changed.Current.Generation != 2 {
-		t.Fatalf("changed Apply() = %+v, want changed generation 2 with previous", changed)
+	if !changed.Changed || changed.Current.Generation != 2 {
+		t.Fatalf("changed Apply() = %+v, want changed generation 2", changed)
 	}
 }

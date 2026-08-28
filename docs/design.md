@@ -2,9 +2,9 @@
 
 > 状态：Draft / 设计已收敛
 >
-> 版本：v0.3
+> 版本：v0.4
 >
-> 更新时间：2026-08-24
+> 更新时间：2026-08-28
 
 ## 1. 背景
 
@@ -210,17 +210,24 @@ ServiceAccount 引用继续保留，直到用户按文档手工清理。
 ## 4. 总体架构
 
 ~~~mermaid
-flowchart LR
+flowchart TB
     Owner[Cluster Owner] --> Config[固定 ConfigMap]
-    Config --> Loader[Config Loader]
-    Loader --> Controller[Leader Controller]
-    Controller --> TokenQueue[Credential Queue]
+    Manager[controller-runtime Manager] --> Cache[Shared Cache and Client]
+    Manager --> ConfigController[Configuration Controller<br/>所有副本]
+    Manager --> NamespaceController[Namespace Controller<br/>仅 Leader 调谐]
+    Manager --> LeaderRuntime[Leader Runtime<br/>恢复与凭据调度]
+    Cache --> ConfigController
+    Cache --> NamespaceController
+    Config --> ConfigController
+    ConfigController --> ConfigStore[Configuration Store]
+    ConfigController --> NamespaceController
+    LeaderRuntime --> TokenQueue[Credential Queue]
     TokenQueue --> ACR[ACR GetAuthorizationToken]
-    ACR --> Store[Credential Store]
-    Store --> SyncQueue[Namespace Sync Queue]
-    SyncQueue --> SecretA[ns-a / auto-patch-secret]
-    SyncQueue --> SecretB[ns-b / auto-patch-secret]
-    SyncQueue --> SA[ServiceAccounts]
+    ACR --> CredentialStore[Credential Store]
+    CredentialStore --> NamespaceController
+    NamespaceController --> SecretA[ns-a / auto-patch-secret]
+    NamespaceController --> SecretB[ns-b / auto-patch-secret]
+    NamespaceController --> SA[ServiceAccounts]
     SecretA --> Kubelet[Kubelet]
     SecretB --> Kubelet
     Kubelet --> Registry[ACR Registry]
@@ -228,14 +235,25 @@ flowchart LR
 
 内部模块：
 
-- Config Loader：读取、校验、规范化并热更新 ConfigMap；
-- Resource Watcher：监听 ConfigMap、Namespace、ServiceAccount 和输出 Secret；
+- Manager：统一管理 Cache、Client、Controller、Leader Election、Metrics、
+  健康检查和优雅退出；
+- Configuration Controller：所有副本读取、校验、规范化并热更新固定 ConfigMap；
+- Namespace Controller：将 Namespace、ServiceAccount、输出 Secret 和内部配置
+  事件映射到以 Namespace 为 Key 的 Reconcile Queue；
+- Leader Runtime：在获得 Leader 身份后按顺序执行状态恢复并启动凭据调度；
 - Credential Store：保存每个 RegistryKey 的当前期望凭据；
 - Credential Scheduler：按 expiresAt 管理 Registry 延迟任务和失败重试；
 - ACR Token Provider：使用实例节点内的 AK/SK 调用 ACR API；
 - Secret Builder：生成完整 Docker Config 和 State；
-- Resource Syncer：有界并发同步 Namespace、Secret 和 ServiceAccount；
+- Resource Syncer：幂等同步 Namespace、Secret 和 ServiceAccount；并发由
+  Namespace Controller 控制；
 - Observability：日志、Event、Metrics 和健康检查。
+
+Manager 是进程级生命周期边界。不得在 main 中另行启动不受 Manager 管理的
+Informer、Worker 或长期 Goroutine。Kubernetes 资源调谐使用
+controller-runtime Controller；没有对应 Kubernetes 对象、按时间触发的
+Credential Scheduler 作为 Leader-only Runnable 使用 client-go Typed
+Delaying/RateLimiting WorkQueue。
 
 ## 5. 配置设计
 
@@ -363,7 +381,7 @@ type RegistryConfig struct {
 
 ### 5.6 重复 Registry 合并
 
-Config Loader 按 RegistryKey 分组：
+Configuration Controller 按 RegistryKey 分组：
 
 - RegistryKey 相同且 AK/SK 相同：合并、去重并排序 Domains；
 - RegistryKey 相同但 AK/SK 不同：拒绝整份新配置，报告
@@ -387,7 +405,7 @@ map[RegistryKey]RegistryConfig
 | 刷新提前量 | 5m |
 | Jitter | 无 |
 | Credential Worker | 2 |
-| Resource Sync Worker | 2 |
+| Namespace 最大并发 Reconcile | 2 |
 | Controller Pod 副本 | 2 |
 | Leader 写入者 | 1 |
 
@@ -564,13 +582,20 @@ Create/Update 中提交。
 
 ## 8. Leader 启动与状态恢复
 
-每次获得 Leader 身份时执行完整恢复，而不只在进程首次启动时执行。
+每个新 Leader 在执行写入前完成一次完整恢复。Manager 丢失 Leader Lease
+时必须结束进程，由 Pod 重启后重新参与选举；不在同一进程中重置并再次
+启动一套 Worker。
+
+Leader Runtime、Credential Scheduler 和 Namespace Controller 都属于
+Leader-only 组件，但 Manager 不保证它们的业务启动顺序。因此 Leader
+Runtime 在恢复完成后打开 recovery gate；Namespace Reconcile 在 gate
+打开前不写资源，并在 gate 打开时由 Leader Runtime 触发一次全量入队。
 
 ### 8.1 初始 List
 
-Leader List 集群中名称为 auto-patch-secret 且带受管标签的 Secret。
+Leader 从 Manager 的固定名称 Secret Cache 中 List 带受管标签的 Secret。
 恢复候选可以来自当前或之前的目标 Namespace；资源分发和清理仍以当前
-namespace 配置为准。Informer 随后持续 Watch 同一固定名称的 Secret。
+namespace 配置为准。同一 Cache 持续 Watch 该固定名称的 Secret。
 
 ### 8.2 按 Registry 恢复
 
@@ -590,7 +615,7 @@ namespace 配置为准。Informer 随后持续 Watch 同一固定名称的 Secre
 11. 将恢复结果写入 Credential Store；
 12. 已到 refreshAt 或没有候选的 Registry 立即加入 Credential Queue；
 13. 其他 Registry 通过 AddAfter 安排到 refreshAt；
-14. 将全部目标 Namespace 加入 Resource Sync Queue。
+14. 将全部目标 Namespace 加入 Namespace Reconcile Queue。
 
 仍在当前配置中但没有有效候选的 Registry 标记为 Pending，并立即取证。
 Pending 不等同于已删除；在取得替代凭据前，资源同步不得从已有受管
@@ -639,7 +664,7 @@ queue.AddRateLimited(key)
 7. 使用该节点的 AK/SK 调用一次 GetAuthorizationToken；
 8. 校验新凭据；
 9. 原子更新 Credential Store，使新凭据成为当前期望凭据；
-10. 为全部目标 Namespace 调用 Resource Sync Queue Add；
+10. 为全部目标 Namespace 发布 Namespace Reconcile 请求；
 11. Forget 当前失败退避；
 12. 按新 ExpiresAt 安排下一次刷新。
 
@@ -665,16 +690,18 @@ Provider 失败退避：
 
 ## 10. Namespace 资源同步
 
-### 10.1 Resource Sync Queue
+### 10.1 Namespace Reconcile Queue
 
-队列 Key 是 Namespace 名称，使用两个 Resource Sync Worker。
+队列 Key 是 Namespace 名称。Namespace Controller 使用 controller-runtime
+的 RateLimiting Queue，并通过 MaxConcurrentReconciles 将并发固定为 2；
+不自行管理 Worker 生命周期。
 
 一次同步读取 Credential Store 的最新完整快照，构建该 Namespace 的
 完整期望 Secret。队列任务不携带某次 Token，避免排队期间旧任务覆盖
 更新的凭据。
 
 如果 Registry A 和 B 同时刷新，它们会添加相同 Namespace Key。
-WorkQueue 对 Key 去重；Worker 执行时读取包含 A、B 最新状态的快照。
+Queue 对 Key 去重；Reconcile 执行时读取包含 A、B 最新状态的快照。
 
 ### 10.2 Secret 同步
 
@@ -714,7 +741,7 @@ Secret 创建或更新成功后再处理 ServiceAccount：
 
 ### 10.4 全量监听和收敛
 
-Controller 对固定名称 Secret 执行初始 List 和持续 Watch：
+Manager Cache 对固定名称 Secret 执行初始 List 和持续 Watch：
 
 ~~~text
 metadata.name=auto-patch-secret
@@ -728,16 +755,16 @@ Watch 的目的包括：
 - 驱动各 Namespace 最终收敛。
 
 Secret Watch 不为每个 Secret 创建刷新任务。若某个 Namespace 持有旧
-expiresAt，只将该 Namespace 加入 Resource Sync Queue，不调用 ACR。
+expiresAt，只将该 Namespace 加入 Namespace Reconcile Queue，不调用 ACR。
 
-Controller 自己的 Secret Update 也会触发 Watch。Reconcile 发现
+Controller 自己的 Secret Update 也会触发 Watch。Namespace Reconcile 发现
 stateHash 和内容已一致后成为无操作，不形成写入循环。
 
 ## 11. 事件映射
 
 | 事件 | 动作 |
 | --- | --- |
-| ConfigMap 更新 | 校验、规范化、比较新旧配置并执行差异动作 |
+| ConfigMap 更新 | 所有副本校验并原子更新 Store；全量入队 Namespace |
 | ConfigMap 删除 | 继续使用最后一份有效配置，不清理 |
 | Namespace 进入目标范围 | 同步 Secret 和 ServiceAccount |
 | Namespace 离开目标范围 | 清理受管 Secret 和固定 SA 引用 |
@@ -751,8 +778,13 @@ Secret。
 
 ## 12. 配置热更新细节
 
-Config Loader 每次都先完整解析和规范化新配置，再原子替换当前配置。
+Configuration Controller 每次都先完整解析和规范化新配置，再原子替换当前配置。
 不允许应用半份配置。
+
+每次成功处理有效 ConfigMap 后都全量入队 Namespace，而不只在 Store 首次
+返回 Changed 时入队。这样即使 Store 已更新后 Namespace List 或事件发布
+暂时失败，标准 Controller 重试仍能完成 fan-out。配置更新频率低，优先
+保证幂等收敛，不维护一次性的命令式新旧配置差异队列。
 
 | 配置差异 | 动作 |
 | --- | --- |
@@ -767,18 +799,20 @@ Config Loader 每次都先完整解析和规范化新配置，再原子替换当
 | serviceaccount 新增目标 | 注入固定引用 |
 | serviceaccount 删除目标 | 移除固定引用 |
 
-启动时配置无效则 Readiness 失败且不运行 Worker。运行中收到无效配置或
-ConfigMap 删除事件时，保留最后一份有效配置、Credential Store 和输出
-Secret，并报告 InvalidConfiguration。
+启动时配置无效则 Readiness 失败；Namespace Reconcile 不执行资源同步，
+Credential Worker 也不启动。运行中收到无效配置或 ConfigMap 删除事件时，
+保留最后一份有效配置、Credential Store 和输出 Secret，并报告
+InvalidConfiguration。
 
 ## 13. 并发、一致性与高可用
 
 ### 13.1 固定并发
 
 - Deployment 固定两个 Pod 副本；
-- Leader Election 保证只有一个写入者；
+- controller-runtime Manager 的 Leader Election 保证只有一个写入者；
+- Configuration Controller 在所有副本运行；
 - Leader 内部运行两个 Credential Worker；
-- Leader 内部运行两个 Resource Sync Worker；
+- Namespace Controller 在 Leader 内最多并发执行两个 Reconcile；
 - 同一个 RegistryKey 不并发取证；
 - 同一个 Namespace 不并发同步；
 - 不为每个 Namespace 无限制创建 Goroutine。
@@ -802,9 +836,15 @@ ACR 返回 T2
 
 ### 13.3 Leader 切换
 
-Follower 保持 ConfigMap 和 Informer Cache 更新，但不运行写入 Worker。
-获得 Leader 身份后必须重新执行第 8 节的完整恢复流程，再启动调度和资源
-同步。
+Follower 运行 Configuration Controller 以保持 ConfigMap Cache 和本地配置
+快照更新，并通过 Namespace Controller 的 source warmup 保持 Namespace、
+ServiceAccount、固定名称 Secret Cache 以及 Reconcile Queue 更新，但不执行
+Namespace Reconcile。
+获得 Leader 身份后必须执行第 8 节的完整恢复流程，打开 recovery gate 后
+才允许调度和资源同步。
+
+EnableWarmup 只用于 Namespace Controller，并由 HA 测试覆盖；其他组件不
+依赖这一 beta 能力。Manager 在非预期丢失 Lease 后返回错误，进程随即退出。
 
 如果多个 Secret 存在不同版本，按 RegistryKey 选择最新有效候选，不按
 Namespace 多数表决，也不使用读到的第一个 Secret。
@@ -884,10 +924,14 @@ Secret 级别的保密语义。
 
 Readiness 条件：
 
-- 固定 ConfigMap 已加载且有效；
-- Informer Cache 已同步；
-- Follower 正常参与 Leader Election，或者 Leader 的 Worker 已启动；
+- 本进程已经加载过至少一份有效的固定 ConfigMap；
+- Configuration Controller 已经通过同步后的 ConfigMap Cache 完成过一次调谐；
+- Leader 身份不是 Pod Readiness 的前置条件，Follower 也必须保持 Ready；
 - 单个 Registry 暂时失败不使整个 Pod NotReady。
+
+启动后尚无有效配置时 Readiness 失败。运行中无效更新或 ConfigMap 删除保留
+最后有效快照，因此不会把已经工作的副本改为 NotReady。Leader recovery
+状态使用单独指标表达，不让 Follower 因未获得 Lease 而失败。
 
 Liveness 只检查进程和核心 Goroutine 是否存活，不依赖 ACR 或单个
 Kubernetes 资源同步结果。
@@ -935,8 +979,8 @@ Kubernetes 资源同步结果。
 资源同步：
 
 - 一百个 Namespace 仍只获取一次 Registry Token；
-- Namespace Queue 按 Key 去重；
-- Worker 读取最新完整 Credential Store 快照；
+- Namespace Reconcile Queue 按 Key 去重；
+- Reconcile 读取最新完整 Credential Store 快照；
 - Secret 删除和漂移后恢复；
 - 同名非受管 Secret 不覆盖；
 - 保留 SA 的其他 imagePullSecrets；
@@ -958,7 +1002,7 @@ Kubernetes 资源同步结果。
 
 ### 17.2 Envtest 集成测试
 
-1. ConfigMap 创建后完成初始同步；
+1. 启动真实 Manager 后，ConfigMap 初始 List 完成配置同步；
 2. 新 Namespace 进入目标范围后创建 auto-patch-secret；
 3. Namespace 离开范围后清理受管 Secret 和 SA 引用；
 4. ServiceAccount 创建后注入引用；
@@ -972,6 +1016,10 @@ Kubernetes 资源同步结果。
 12. Provider 和 Kubernetes API 错误分别重试；
 13. Pending Registry 的旧 Auth 在其他 Registry 更新时得到保留；
 14. Leader 退出后新 Leader 恢复部分分发状态。
+
+Manager 集成测试关闭监听端口和 Leader Election，使用真实 API Server 验证
+精确 Cache、初始 List、持续 Watch、标准 Queue 重试和优雅停止。双副本
+Leader Election、warmup 和恢复顺序在 Kind 测试中验证。
 
 测试使用 Fake Provider 和 Fake Clock，不依赖真实等待时间。
 
@@ -1004,7 +1052,8 @@ Kubernetes 资源同步结果。
 7. 一个 Registry 在集群中只有一份当前期望凭据和一个刷新任务；
 8. 一百个 Namespace 对同一 Registry 只产生一次 Token 获取；
 9. Token 在过期前五分钟刷新；
-10. 两个 Credential Worker 和两个 Resource Worker 实现有界并发；
+10. 两个 Credential Worker 和 Namespace Controller 的两个并发 Reconcile
+    实现有界并发；
 11. Controller 重启后能从最新有效 Secret 副本恢复；
 12. 部分分发后不按多数回滚到旧凭据；
 13. Secret 删除或漂移后自动修复；
@@ -1026,7 +1075,8 @@ Kubernetes 资源同步结果。
 - SBOM、镜像摘要和版本变更记录。
 
 Deployment 固定 replicas: 2，并启用 Leader Election。滚动升级期间只有
-一个 Leader 执行取证和写入。
+一个 Leader 执行取证和写入。生产启动参数保持 --leader-elect=true；本地
+开发和单进程测试可显式设置 --leader-elect=false。
 
 卸载步骤：
 

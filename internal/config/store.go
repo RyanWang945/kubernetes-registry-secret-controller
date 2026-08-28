@@ -9,10 +9,8 @@ type Store struct {
 }
 
 type ApplyResult struct {
-	Previous    ConfigurationSnapshot
-	Current     ConfigurationSnapshot
-	HadPrevious bool
-	Changed     bool
+	Current ConfigurationSnapshot
+	Changed bool
 }
 
 // Apply atomically installs a semantically new snapshot. Equivalent updates do
@@ -25,16 +23,12 @@ func (s *Store) Apply(candidate ConfigurationSnapshot) ApplyResult {
 	if s.current != nil && s.current.Equal(candidate) {
 		current := s.current.Clone()
 		return ApplyResult{
-			Previous:    current.Clone(),
-			Current:     current,
-			HadPrevious: true,
+			Current: current,
 		}
 	}
 
 	result := ApplyResult{Changed: true}
 	if s.current != nil {
-		result.Previous = s.current.Clone()
-		result.HadPrevious = true
 		candidate.Generation = s.current.Generation + 1
 	} else {
 		candidate.Generation = 1
@@ -52,4 +46,21 @@ func (s *Store) Load() (ConfigurationSnapshot, bool) {
 		return ConfigurationSnapshot{}, false
 	}
 	return s.current.Clone(), true
+}
+
+// Loaded reports whether at least one valid configuration has been applied.
+func (s *Store) Loaded() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.current != nil
+}
+
+// MatchesServiceAccount performs the hot event-filtering query without cloning
+// the complete configuration snapshot for every ServiceAccount event.
+func (s *Store) MatchesServiceAccount(namespace, serviceAccount string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.current != nil &&
+		s.current.MatchesNamespace(namespace) &&
+		s.current.ServiceAccounts.Matches(serviceAccount)
 }

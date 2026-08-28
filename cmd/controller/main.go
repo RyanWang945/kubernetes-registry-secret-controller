@@ -1,38 +1,56 @@
 package main
 
 import (
-	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
-	"syscall"
+	"time"
 
-	"k8s.io/client-go/kubernetes"
+	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/controller"
 )
 
-const userAgent = "kubernetes-registry-secret-controller"
+const (
+	userAgent               = "kubernetes-registry-secret-controller"
+	defaultMetricsAddress   = ":8080"
+	defaultHealthAddress    = ":8081"
+	gracefulShutdownTimeout = 30 * time.Second
+)
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
+	handler := slog.NewJSONHandler(os.Stdout, nil)
+	slog.SetDefault(slog.New(handler))
+	logger := logr.FromSlogHandler(handler)
+	ctrl.SetLogger(logger)
 
 	if err := run(logger); err != nil {
-		logger.Error("controller exited", "error", err)
+		logger.Error(err, "controller exited")
 		os.Exit(1)
 	}
 }
 
-func run(logger *slog.Logger) error {
-	var kubeconfig string
+func run(logger logr.Logger) error {
+	var (
+		kubeconfig     string
+		metricsAddress string
+		healthAddress  string
+		leaderElection bool
+	)
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "path to a kubeconfig for local development; in-cluster configuration is used by default")
+	flag.StringVar(&metricsAddress, "metrics-bind-address", defaultMetricsAddress, "address for the Prometheus metrics endpoint; set to 0 to disable")
+	flag.StringVar(&healthAddress, "health-probe-bind-address", defaultHealthAddress, "address for liveness and readiness probes; set to 0 to disable")
+	flag.BoolVar(&leaderElection, "leader-elect", true, "enable leader election for the controller manager")
 	flag.Parse()
 
 	restConfig, err := loadRESTConfig(kubeconfig)
@@ -41,29 +59,60 @@ func run(logger *slog.Logger) error {
 	}
 	restConfig.UserAgent = userAgent
 
-	client, err := kubernetes.NewForConfig(restConfig)
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		return fmt.Errorf("register Kubernetes scheme: %w", err)
+	}
+
+	controllerOptions := controller.ControllerOptions{}
+	cacheOptions, err := controller.NewCacheOptions(controllerOptions)
 	if err != nil {
-		return fmt.Errorf("create Kubernetes client: %w", err)
+		return fmt.Errorf("configure controller cache: %w", err)
+	}
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme:                        scheme,
+		Cache:                         cacheOptions,
+		Logger:                        logger,
+		LeaderElection:                leaderElection,
+		LeaderElectionID:              controller.DefaultLeaderElectionID,
+		LeaderElectionNamespace:       controller.DefaultControllerNamespace,
+		LeaderElectionReleaseOnCancel: true,
+		Metrics:                       metricsserver.Options{BindAddress: metricsAddress},
+		HealthProbeBindAddress:        healthAddress,
+		GracefulShutdownTimeout:       ptr.To(gracefulShutdownTimeout),
+	})
+	if err != nil {
+		return fmt.Errorf("create controller manager: %w", err)
 	}
 
 	configStore := &config.Store{}
-	syncer := controller.NewLoggingSyncer(logger)
-	resourceController, err := controller.New(client, configStore, syncer, controller.ControllerOptions{Logger: logger})
-	if err != nil {
-		return fmt.Errorf("create controller: %w", err)
+	if err := controller.SetupWithManager(
+		mgr,
+		configStore,
+		controller.LoggingSyncer{},
+		controllerOptions,
+	); err != nil {
+		return fmt.Errorf("register controllers: %w", err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	if err := mgr.AddHealthzCheck("ping", healthz.Ping); err != nil {
+		return fmt.Errorf("register liveness check: %w", err)
+	}
+	if err := mgr.AddReadyzCheck("configuration", controller.ConfigurationReadyCheck(configStore)); err != nil {
+		return fmt.Errorf("register configuration readiness check: %w", err)
+	}
 
 	logger.Info(
-		"starting controller listener skeleton",
+		"starting controller manager",
 		"config_namespace", controller.DefaultControllerNamespace,
 		"config_name", controller.DefaultConfigMapName,
-		"resource_workers", controller.DefaultResourceWorkers,
+		"managed_secret_name", controller.DefaultManagedSecretName,
+		"max_concurrent_namespace_reconciles", controller.DefaultMaxConcurrentNamespaceReconciles,
+		"leader_election", leaderElection,
 	)
-	if err := resourceController.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		return err
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		return fmt.Errorf("run controller manager: %w", err)
 	}
 	return nil
 }

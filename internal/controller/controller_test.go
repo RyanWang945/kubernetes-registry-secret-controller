@@ -3,16 +3,22 @@ package controller
 import (
 	"context"
 	"errors"
-	"io"
-	"log/slog"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
 )
@@ -26,267 +32,304 @@ const testRegistries = `
     - registry-test.cn-hangzhou.cr.aliyuncs.com
 `
 
-func TestEventHandlersMapResourcesToNamespaceKeys(t *testing.T) {
+func TestConfigurationReconcilerAppliesAndFansOut(t *testing.T) {
 	t.Parallel()
 
-	client := fake.NewSimpleClientset()
+	options := ControllerOptions{}.withDefaults()
 	store := &config.Store{}
-	configData := testConfigData(config.Wildcard, "default,build")
-	configData[config.ExcludeNamespaceKey] = "ignored"
-	snapshot, err := config.Parse(configData)
+	events := make(chan event.GenericEvent, 8)
+	kubernetesClient := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithObjects(
+			testConfigMap("production", "default"),
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "production"}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ignored"}},
+		).
+		Build()
+	reconciler := &ConfigurationReconciler{
+		client:          kubernetesClient,
+		store:           store,
+		namespaceEvents: events,
+		options:         options,
+	}
+
+	request := ctrl.Request{NamespacedName: types.NamespacedName{
+		Namespace: options.ControllerNamespace,
+		Name:      options.ConfigMapName,
+	}}
+	if _, err := reconciler.Reconcile(testContext(), request); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	snapshot, loaded := store.Load()
+	if !loaded || snapshot.Generation != 1 || !snapshot.MatchesNamespace("production") {
+		t.Fatalf("loaded snapshot = %+v, present = %v; want generation 1", snapshot, loaded)
+	}
+	assertNamespaceEvents(t, events, "ignored", "production")
+
+	configMap := &corev1.ConfigMap{}
+	if err := kubernetesClient.Get(context.Background(), request.NamespacedName, configMap); err != nil {
+		t.Fatalf("Get() ConfigMap error = %v", err)
+	}
+	configMap.Data[config.NamespaceKey] = " production "
+	if err := kubernetesClient.Update(context.Background(), configMap); err != nil {
+		t.Fatalf("Update() ConfigMap error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(testContext(), request); err != nil {
+		t.Fatalf("equivalent Reconcile() error = %v", err)
+	}
+
+	unchanged, _ := store.Load()
+	if unchanged.Generation != 1 {
+		t.Fatalf("equivalent configuration generation = %d, want 1", unchanged.Generation)
+	}
+	assertNamespaceEvents(t, events, "ignored", "production")
+}
+
+func TestConfigurationReconcilerRetainsLastValidConfiguration(t *testing.T) {
+	t.Parallel()
+
+	options := ControllerOptions{}.withDefaults()
+	store := &config.Store{}
+	events := make(chan event.GenericEvent, 4)
+	configMap := testConfigMap("production", "default")
+	kubernetesClient := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(
+		configMap,
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "production"}},
+	).Build()
+	reconciler := &ConfigurationReconciler{
+		client:          kubernetesClient,
+		store:           store,
+		namespaceEvents: events,
+		options:         options,
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(configMap)}
+
+	if _, err := reconciler.Reconcile(testContext(), request); err != nil {
+		t.Fatalf("initial Reconcile() error = %v", err)
+	}
+	assertNamespaceEvents(t, events, "production")
+
+	current := &corev1.ConfigMap{}
+	if err := kubernetesClient.Get(context.Background(), request.NamespacedName, current); err != nil {
+		t.Fatalf("Get() ConfigMap error = %v", err)
+	}
+	current.Data[config.NamespaceKey] = "production,,staging"
+	if err := kubernetesClient.Update(context.Background(), current); err != nil {
+		t.Fatalf("Update() invalid ConfigMap error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(testContext(), request); err != nil {
+		t.Fatalf("invalid Reconcile() error = %v", err)
+	}
+	assertNoNamespaceEvent(t, events)
+
+	if err := kubernetesClient.Delete(context.Background(), current); err != nil {
+		t.Fatalf("Delete() ConfigMap error = %v", err)
+	}
+	if _, err := reconciler.Reconcile(testContext(), request); err != nil {
+		t.Fatalf("deleted Reconcile() error = %v", err)
+	}
+	assertNoNamespaceEvent(t, events)
+
+	after, loaded := store.Load()
+	if !loaded || after.Generation != 1 || !after.MatchesNamespace("production") {
+		t.Fatalf("snapshot after invalid update and deletion = %+v, present = %v", after, loaded)
+	}
+}
+
+func TestConfigurationReconcilerRetriesFanOutAfterStoreApply(t *testing.T) {
+	t.Parallel()
+
+	options := ControllerOptions{}.withDefaults()
+	store := &config.Store{}
+	events := make(chan event.GenericEvent, 2)
+	baseClient := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(
+		testConfigMap("production", "default"),
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "production"}},
+	).Build()
+	kubernetesClient := &failOnceNamespaceListClient{Client: baseClient}
+	reconciler := &ConfigurationReconciler{
+		client:          kubernetesClient,
+		store:           store,
+		namespaceEvents: events,
+		options:         options,
+	}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{
+		Namespace: options.ControllerNamespace,
+		Name:      options.ConfigMapName,
+	}}
+
+	if _, err := reconciler.Reconcile(testContext(), request); err == nil {
+		t.Fatal("first Reconcile() error = nil, want Namespace list failure")
+	}
+	first, loaded := store.Load()
+	if !loaded || first.Generation != 1 {
+		t.Fatalf("snapshot after failed fan-out = %+v, present = %v; want applied generation 1", first, loaded)
+	}
+
+	if _, err := reconciler.Reconcile(testContext(), request); err != nil {
+		t.Fatalf("retry Reconcile() error = %v", err)
+	}
+	second, _ := store.Load()
+	if second.Generation != 1 {
+		t.Fatalf("retry advanced generation to %d, want 1", second.Generation)
+	}
+	assertNamespaceEvents(t, events, "production")
+}
+
+func TestNamespaceReconcilerUsesLatestConfigurationGateAndReturnsErrors(t *testing.T) {
+	t.Parallel()
+
+	store := &config.Store{}
+	retryErr := errors.New("temporary sync failure")
+	recorder := newRecordingSyncer(func(call int, namespace string) error {
+		if call == 1 && namespace == "production" {
+			return retryErr
+		}
+		return nil
+	})
+	reconciler := &NamespaceReconciler{store: store, syncer: recorder}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Name: "production"}}
+
+	if _, err := reconciler.Reconcile(testContext(), request); err != nil {
+		t.Fatalf("Reconcile() before configuration error = %v", err)
+	}
+	if recorder.count("production") != 0 {
+		t.Fatal("NamespaceSyncer ran before a valid configuration was loaded")
+	}
+
+	snapshot, err := config.Parse(testConfigData("production", "default"))
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
 	store.Apply(snapshot)
 
-	resourceController := newTestController(t, client, store, NamespaceSyncFunc(func(context.Context, string) error {
-		return nil
-	}))
-	t.Cleanup(resourceController.resourceQueue.ShutDown)
-
-	resourceController.onNamespaceAdd(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ignored"}})
-	resourceController.onNamespaceAdd(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "production"}})
-	resourceController.onNamespaceAdd(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "production"}})
-	if got := resourceController.resourceQueue.Len(); got != 1 {
-		t.Fatalf("queue length after Namespace events = %d, want 1", got)
+	if _, err := reconciler.Reconcile(testContext(), request); !errors.Is(err, retryErr) {
+		t.Fatalf("first configured Reconcile() error = %v, want %v", err, retryErr)
 	}
-	if key := takeQueueKey(t, resourceController); key != "production" {
-		t.Fatalf("Namespace event key = %q, want production", key)
+	if _, err := reconciler.Reconcile(testContext(), request); err != nil {
+		t.Fatalf("second configured Reconcile() error = %v", err)
+	}
+	if recorder.count("production") != 2 || recorder.successes("production") != 1 {
+		t.Fatalf("sync calls = %d, successes = %d; want 2 and 1", recorder.count("production"), recorder.successes("production"))
 	}
 
-	resourceController.onServiceAccountChange(&corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{Name: "ignored", Namespace: "production"},
-	})
-	if got := resourceController.resourceQueue.Len(); got != 0 {
-		t.Fatalf("queue length after non-target ServiceAccount = %d, want 0", got)
+	namespacedRequest := ctrl.Request{NamespacedName: types.NamespacedName{
+		Namespace: "unexpected",
+		Name:      "production",
+	}}
+	if _, err := reconciler.Reconcile(testContext(), namespacedRequest); err != nil {
+		t.Fatalf("namespaced Reconcile() error = %v", err)
 	}
+	if recorder.count("production") != 2 {
+		t.Fatal("NamespaceReconciler accepted a namespaced request for a cluster-scoped key")
+	}
+}
 
-	resourceController.onServiceAccountChange(&corev1.ServiceAccount{
+func TestEventMappersProduceNamespaceRequests(t *testing.T) {
+	t.Parallel()
+
+	store := &config.Store{}
+	data := testConfigData(config.Wildcard, "default,build")
+	data[config.ExcludeNamespaceKey] = "ignored"
+	snapshot, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	store.Apply(snapshot)
+
+	serviceAccounts := mapTargetServiceAccount(store)
+	assertRequests(t, serviceAccounts(context.Background(), &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "production"},
-	})
-	if key := takeQueueKey(t, resourceController); key != "production" {
-		t.Fatalf("ServiceAccount event key = %q, want production", key)
-	}
-}
-
-func TestConfigMapUpdatesAreAtomicAndDeletionRetainsConfiguration(t *testing.T) {
-	t.Parallel()
-
-	client := fake.NewSimpleClientset()
-	store := &config.Store{}
-	resourceController := newTestController(t, client, store, NamespaceSyncFunc(func(context.Context, string) error {
-		return nil
+	}), "production")
+	assertRequests(t, serviceAccounts(context.Background(), &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "production"},
 	}))
-	t.Cleanup(resourceController.resourceQueue.ShutDown)
+	assertRequests(t, serviceAccounts(context.Background(), &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "ignored"},
+	}))
 
-	valid := testConfigMap("production", "default")
-	resourceController.onConfigMapAdd(valid)
-	first, loaded := store.Load()
-	if !loaded || first.Generation != 1 {
-		t.Fatalf("first snapshot = %+v, loaded = %v; want generation 1", first, loaded)
-	}
-
-	equivalent := valid.DeepCopy()
-	equivalent.Data[config.NamespaceKey] = " production "
-	resourceController.onConfigMapAdd(equivalent)
-	unchanged, _ := store.Load()
-	if unchanged.Generation != 1 {
-		t.Fatalf("equivalent update generation = %d, want 1", unchanged.Generation)
-	}
-
-	invalid := valid.DeepCopy()
-	invalid.Data[config.NamespaceKey] = "production,,staging"
-	resourceController.onConfigMapAdd(invalid)
-	afterInvalid, _ := store.Load()
-	if afterInvalid.Generation != 1 || !afterInvalid.Equal(first) {
-		t.Fatalf("invalid update replaced the last valid configuration: %+v", afterInvalid)
-	}
-
-	resourceController.onConfigMapDelete(valid)
-	afterDelete, _ := store.Load()
-	if afterDelete.Generation != 1 || !afterDelete.Equal(first) {
-		t.Fatalf("delete removed the last valid configuration: %+v", afterDelete)
-	}
-
-	changed := valid.DeepCopy()
-	changed.Data[config.NamespaceKey] = "production,staging"
-	resourceController.onConfigMapAdd(changed)
-	second, _ := store.Load()
-	if second.Generation != 2 || !second.MatchesNamespace("staging") {
-		t.Fatalf("valid update snapshot = %+v, want generation 2 targeting staging", second)
-	}
+	secrets := mapManagedSecret(DefaultManagedSecretName)
+	assertRequests(t, secrets(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: DefaultManagedSecretName, Namespace: "production"},
+	}), "production")
+	assertRequests(t, secrets(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "production"},
+	}))
 }
 
-func TestControllerInitialListAndContinuousWatch(t *testing.T) {
+func TestCacheOptionsAndReadiness(t *testing.T) {
 	t.Parallel()
 
-	client := fake.NewSimpleClientset(
-		testConfigMap("production,staging", "default,build"),
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "production"}},
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ignored"}},
-	)
-	recorder := newRecordingSyncer(nil)
-	store := &config.Store{}
-	resourceController := newTestController(t, client, store, recorder)
+	cacheOptions, err := NewCacheOptions(ControllerOptions{})
+	if err != nil {
+		t.Fatalf("NewCacheOptions() error = %v", err)
+	}
+	if !cacheOptions.ReaderFailOnMissingInformer || cacheOptions.DefaultTransform == nil {
+		t.Fatalf("cache options = %+v; want strict readers and managedFields transform", cacheOptions)
+	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	runDone := make(chan error, 1)
-	go func() { runDone <- resourceController.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-runDone:
-			if err != nil {
-				t.Errorf("Run() error = %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("Run() did not stop within 5 seconds")
+	var configMaps, namespaces, serviceAccounts, secrets bool
+	for object, byObject := range cacheOptions.ByObject {
+		switch object.(type) {
+		case *corev1.ConfigMap:
+			configMaps = len(byObject.Namespaces) == 1 &&
+				byObject.Field.String() == "metadata.name="+DefaultConfigMapName
+		case *corev1.Namespace:
+			namespaces = true
+		case *corev1.ServiceAccount:
+			serviceAccounts = true
+		case *corev1.Secret:
+			secrets = byObject.Field.String() == "metadata.name="+DefaultManagedSecretName
 		}
-	})
-
-	waitForSignal(t, resourceController.CachesSynced(), "informer cache synchronization")
-	recorder.waitForCount(t, "production", 1)
-	if recorder.count("ignored") != 0 {
-		t.Fatalf("ignored namespace reconciliations = %d, want 0", recorder.count("ignored"))
+	}
+	if !configMaps || !namespaces || !serviceAccounts || !secrets {
+		t.Fatalf("cache registrations: ConfigMap=%v Namespace=%v ServiceAccount=%v Secret=%v", configMaps, namespaces, serviceAccounts, secrets)
 	}
 
-	_, err := client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{Name: "staging"},
-	}, metav1.CreateOptions{})
+	if _, err := NewCacheOptions(ControllerOptions{MaxConcurrentNamespaceReconciles: -1}); err == nil {
+		t.Fatal("NewCacheOptions() accepted negative namespace reconcile concurrency")
+	}
+
+	store := &config.Store{}
+	check := ConfigurationReadyCheck(store)
+	if err := check(nil); err == nil {
+		t.Fatal("readiness before valid configuration = nil, want error")
+	}
+	snapshot, err := config.Parse(testConfigData("production", "default"))
 	if err != nil {
-		t.Fatalf("create target Namespace: %v", err)
+		t.Fatalf("Parse() error = %v", err)
 	}
-	recorder.waitForCount(t, "staging", 1)
-
-	productionBefore := recorder.count("production")
-	_, err = client.CoreV1().ServiceAccounts("production").Create(ctx, &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "production"},
-	}, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("create target ServiceAccount: %v", err)
-	}
-	recorder.waitForCount(t, "production", productionBefore+1)
-
-	loaded, ok := store.Load()
-	if !ok || loaded.Generation != 1 {
-		t.Fatalf("loaded configuration = %+v, present = %v; want generation 1", loaded, ok)
+	store.Apply(snapshot)
+	if err := check(nil); err != nil {
+		t.Fatalf("readiness after valid configuration error = %v", err)
 	}
 }
 
-func TestControllerWaitsForValidConfigAndRetriesSync(t *testing.T) {
-	t.Parallel()
-
-	client := fake.NewSimpleClientset(
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "production"}},
-	)
-	retryErr := errors.New("temporary sync failure")
-	recorder := newRecordingSyncer(func(call int, namespace string) error {
-		if namespace == "production" && call == 1 {
-			return retryErr
-		}
-		return nil
-	})
-	store := &config.Store{}
-	resourceController := newTestController(t, client, store, recorder)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	runDone := make(chan error, 1)
-	go func() { runDone <- resourceController.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-runDone:
-			if err != nil {
-				t.Errorf("Run() error = %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("Run() did not stop within 5 seconds")
-		}
-	})
-
-	waitForSignal(t, resourceController.CachesSynced(), "informer cache synchronization")
-	if recorder.count("production") != 0 {
-		t.Fatal("resource worker ran before a valid ConfigMap was loaded")
-	}
-
-	_, err := client.CoreV1().ConfigMaps(DefaultControllerNamespace).Create(
-		ctx,
-		testConfigMap("production", "default"),
-		metav1.CreateOptions{},
-	)
-	if err != nil {
-		t.Fatalf("create ConfigMap: %v", err)
-	}
-	recorder.waitForCount(t, "production", 2)
-	if recorder.successes("production") != 1 {
-		t.Fatalf("successful production reconciliations = %d, want 1", recorder.successes("production"))
-	}
+type failOnceNamespaceListClient struct {
+	client.Client
+	failed bool
 }
 
-func TestConfigMapDeleteWatchRetainsLastValidConfiguration(t *testing.T) {
-	t.Parallel()
-
-	configMap := testConfigMap("production", "default")
-	client := fake.NewSimpleClientset(configMap)
-	store := &config.Store{}
-	resourceController := newTestController(t, client, store, newRecordingSyncer(nil))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	runDone := make(chan error, 1)
-	go func() { runDone <- resourceController.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-runDone:
-			if err != nil {
-				t.Errorf("Run() error = %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("Run() did not stop within 5 seconds")
-		}
-	})
-
-	waitForSignal(t, resourceController.CachesSynced(), "informer cache synchronization")
-	eventually(t, 5*time.Second, func() bool {
-		snapshot, ok := store.Load()
-		return ok && snapshot.Generation == 1
-	}, "initial valid configuration was not loaded")
-
-	if err := client.CoreV1().ConfigMaps(DefaultControllerNamespace).Delete(
-		ctx,
-		DefaultConfigMapName,
-		metav1.DeleteOptions{},
-	); err != nil {
-		t.Fatalf("delete ConfigMap: %v", err)
+func (c *failOnceNamespaceListClient) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	if _, ok := list.(*corev1.NamespaceList); ok && !c.failed {
+		c.failed = true
+		return errors.New("temporary Namespace list failure")
 	}
-
-	eventually(t, 5*time.Second, func() bool {
-		_, err := resourceController.configMapInformer.Lister().ConfigMaps(DefaultControllerNamespace).Get(DefaultConfigMapName)
-		return apierrors.IsNotFound(err)
-	}, "ConfigMap delete was not observed by the informer")
-
-	snapshot, ok := store.Load()
-	if !ok || snapshot.Generation != 1 || !snapshot.MatchesNamespace("production") {
-		t.Fatalf("snapshot after ConfigMap deletion = %+v, present = %v", snapshot, ok)
-	}
+	return c.Client.List(ctx, list, options...)
 }
 
-func newTestController(
-	t *testing.T,
-	client *fake.Clientset,
-	store *config.Store,
-	syncer NamespaceSyncer,
-) *Controller {
+func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
-	resourceController, err := New(client, store, syncer, ControllerOptions{Logger: testLogger()})
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme() error = %v", err)
 	}
-	return resourceController
+	return scheme
 }
 
-func testLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+func testContext() context.Context {
+	return log.IntoContext(context.Background(), logr.Discard())
 }
 
 func testConfigMap(namespace, serviceAccount string) *corev1.ConfigMap {
@@ -307,41 +350,41 @@ func testConfigData(namespace, serviceAccount string) map[string]string {
 	}
 }
 
-func takeQueueKey(t *testing.T, resourceController *Controller) string {
+func assertNamespaceEvents(t *testing.T, events <-chan event.GenericEvent, expected ...string) {
 	t.Helper()
-	key, shutdown := resourceController.resourceQueue.Get()
-	if shutdown {
-		t.Fatal("queue shut down while taking a key")
+	actual := make(map[string]bool, len(expected))
+	for range expected {
+		select {
+		case received := <-events:
+			actual[received.Object.GetName()] = true
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for Namespace events; got %v, want %v", actual, expected)
+		}
 	}
-	resourceController.resourceQueue.Done(key)
-	resourceController.resourceQueue.Forget(key)
-	return key
+	for _, namespace := range expected {
+		if !actual[namespace] {
+			t.Fatalf("Namespace events = %v, missing %q", actual, namespace)
+		}
+	}
 }
 
-func waitForSignal(t *testing.T, signal <-chan struct{}, description string) {
+func assertNoNamespaceEvent(t *testing.T, events <-chan event.GenericEvent) {
 	t.Helper()
 	select {
-	case <-signal:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("timed out waiting for %s", description)
+	case received := <-events:
+		t.Fatalf("unexpected Namespace event for %q", received.Object.GetName())
+	default:
 	}
 }
 
-func eventually(t *testing.T, timeout time.Duration, condition func() bool, failureMessage string) {
+func assertRequests(t *testing.T, actual []reconcile.Request, expected ...string) {
 	t.Helper()
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		if condition() {
-			return
-		}
-		select {
-		case <-deadline.C:
-			t.Fatal(failureMessage)
-		case <-ticker.C:
+	if len(actual) != len(expected) {
+		t.Fatalf("requests = %+v, want Names %v", actual, expected)
+	}
+	for index, namespace := range expected {
+		if actual[index].Name != namespace || actual[index].Namespace != "" {
+			t.Fatalf("request[%d] = %+v, want cluster-scoped key %q", index, actual[index], namespace)
 		}
 	}
 }
@@ -374,7 +417,6 @@ func (r *recordingSyncer) SyncNamespace(_ context.Context, namespace string) err
 	if result != nil {
 		err = result(call, namespace)
 	}
-
 	if err == nil {
 		r.mu.Lock()
 		r.successful[namespace]++
@@ -401,7 +443,7 @@ func (r *recordingSyncer) successes(namespace string) int {
 
 func (r *recordingSyncer) waitForCount(t *testing.T, namespace string, count int) {
 	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
+	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
 	for {
 		if r.count(namespace) >= count {

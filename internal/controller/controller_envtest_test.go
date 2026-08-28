@@ -4,16 +4,22 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
 )
@@ -22,7 +28,7 @@ import (
 // v1.36.2 is the newest published control-plane bundle for the v1.36 line.
 const envtestKubernetesVersion = "1.36.2"
 
-func TestControllerEnvtestInitialListAndContinuousWatch(t *testing.T) {
+func TestManagerInitialListAndContinuousWatch(t *testing.T) {
 	assetsDirectory := filepath.Join(repositoryRoot(t), ".cache", "envtest")
 	testEnvironment := &envtest.Environment{
 		DownloadBinaryAssets:        true,
@@ -42,154 +48,210 @@ func TestControllerEnvtestInitialListAndContinuousWatch(t *testing.T) {
 		}
 	})
 
-	client, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		t.Fatalf("create Kubernetes client: %v", err)
+	scheme := k8sruntime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("register Kubernetes scheme: %v", err)
 	}
+	apiClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatalf("create direct Kubernetes client: %v", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-
 	for _, namespace := range []string{DefaultControllerNamespace, "production"} {
-		if _, err := client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+		if err := apiClient.Create(ctx, &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: namespace},
-		}, metav1.CreateOptions{}); err != nil {
+		}); err != nil {
 			t.Fatalf("create initial Namespace %q: %v", namespace, err)
 		}
 	}
-	if _, err := client.CoreV1().ConfigMaps(DefaultControllerNamespace).Create(
-		ctx,
-		testConfigMap("production,staging", "default,build"),
-		metav1.CreateOptions{},
-	); err != nil {
+	if err := apiClient.Create(ctx, testConfigMap("production,staging,retry", "default,build")); err != nil {
 		t.Fatalf("create initial ConfigMap: %v", err)
 	}
 
-	store := &config.Store{}
-	recorder := newRecordingSyncer(nil)
-	resourceController, err := New(client, store, recorder, ControllerOptions{Logger: testLogger()})
+	cacheOptions, err := NewCacheOptions(ControllerOptions{})
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewCacheOptions() error = %v", err)
 	}
+	manager, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme:                 scheme,
+		Cache:                  cacheOptions,
+		Logger:                 logr.Discard(),
+		LeaderElection:         false,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+	})
+	if err != nil {
+		t.Fatalf("create Manager: %v", err)
+	}
+
+	retryErr := errors.New("temporary sync failure")
+	store := &config.Store{}
+	recorder := newRecordingSyncer(func(call int, namespace string) error {
+		if namespace == "retry" && call == 1 {
+			return retryErr
+		}
+		return nil
+	})
+	if err := SetupWithManager(manager, store, recorder, ControllerOptions{}); err != nil {
+		t.Fatalf("SetupWithManager() error = %v", err)
+	}
+
 	runDone := make(chan error, 1)
-	go func() { runDone <- resourceController.Run(ctx) }()
+	go func() { runDone <- manager.Start(ctx) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
 		case err := <-runDone:
 			if err != nil {
-				t.Errorf("Run() error = %v", err)
+				t.Errorf("Manager.Start() error = %v", err)
 			}
 		case <-time.After(10 * time.Second):
-			t.Error("Run() did not stop within 10 seconds")
+			t.Error("Manager did not stop within 10 seconds")
 		}
 	})
 
-	waitForSignal(t, resourceController.CachesSynced(), "envtest informer cache synchronization")
+	if !manager.GetCache().WaitForCacheSync(ctx) {
+		t.Fatal("Manager cache did not synchronize")
+	}
 	recorder.waitForCount(t, "production", 1)
-	eventually(t, 5*time.Second, func() bool {
+	eventually(t, 10*time.Second, func() bool {
 		snapshot, ok := store.Load()
 		return ok && snapshot.Generation == 1
-	}, "initial ConfigMap was not loaded through the informer List")
+	}, "initial ConfigMap was not reconciled through the Manager cache")
 
-	if _, err := client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+	if err := apiClient.Create(ctx, &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: "staging"},
-	}, metav1.CreateOptions{}); err != nil {
+	}); err != nil {
 		t.Fatalf("create watched Namespace: %v", err)
 	}
 	recorder.waitForCount(t, "staging", 1)
 
+	if err := apiClient.Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "retry"},
+	}); err != nil {
+		t.Fatalf("create retry Namespace: %v", err)
+	}
+	recorder.waitForCount(t, "retry", 2)
+	if recorder.successes("retry") != 1 {
+		t.Fatalf("successful retry reconciliations = %d, want 1", recorder.successes("retry"))
+	}
+
 	productionBefore := recorder.count("production")
-	serviceAccount, err := client.CoreV1().ServiceAccounts("production").Create(ctx, &corev1.ServiceAccount{
+	serviceAccount := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "production"},
-	}, metav1.CreateOptions{})
-	if err != nil {
+	}
+	if err := apiClient.Create(ctx, serviceAccount); err != nil {
 		t.Fatalf("create watched ServiceAccount: %v", err)
 	}
 	recorder.waitForCount(t, "production", productionBefore+1)
 
 	productionBefore = recorder.count("production")
 	serviceAccount.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "manually-added"}}
-	if _, err := client.CoreV1().ServiceAccounts("production").Update(
-		ctx,
-		serviceAccount,
-		metav1.UpdateOptions{},
-	); err != nil {
+	if err := apiClient.Update(ctx, serviceAccount); err != nil {
 		t.Fatalf("update watched ServiceAccount: %v", err)
 	}
 	recorder.waitForCount(t, "production", productionBefore+1)
 
-	configMap, err := client.CoreV1().ConfigMaps(DefaultControllerNamespace).Get(
-		ctx,
-		DefaultConfigMapName,
-		metav1.GetOptions{},
-	)
-	if err != nil {
+	productionBefore = recorder.count("production")
+	if err := apiClient.Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: DefaultManagedSecretName, Namespace: "production"},
+	}); err != nil {
+		t.Fatalf("create watched managed Secret: %v", err)
+	}
+	recorder.waitForCount(t, "production", productionBefore+1)
+
+	configMap := &corev1.ConfigMap{}
+	configMapKey := client.ObjectKey{Namespace: DefaultControllerNamespace, Name: DefaultConfigMapName}
+	if err := apiClient.Get(ctx, configMapKey, configMap); err != nil {
 		t.Fatalf("get ConfigMap for invalid update: %v", err)
 	}
 	configMap.Data[config.NamespaceKey] = "production,,staging"
-	invalidUpdate, err := client.CoreV1().ConfigMaps(DefaultControllerNamespace).Update(
-		ctx,
-		configMap,
-		metav1.UpdateOptions{},
-	)
-	if err != nil {
+	if err := apiClient.Update(ctx, configMap); err != nil {
 		t.Fatalf("update invalid ConfigMap: %v", err)
 	}
-	waitForConfigMapResourceVersion(t, resourceController, invalidUpdate.ResourceVersion)
+	waitForCachedConfigMapResourceVersion(t, manager.GetClient(), configMapKey, configMap.ResourceVersion)
 	unchanged, ok := store.Load()
 	if !ok || unchanged.Generation != 1 || !unchanged.MatchesNamespace("staging") {
 		t.Fatalf("invalid update replaced the last valid snapshot: %+v, present = %v", unchanged, ok)
 	}
 
-	if _, err := client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+	if err := apiClient.Create(ctx, &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: "future"},
-	}, metav1.CreateOptions{}); err != nil {
+	}); err != nil {
 		t.Fatalf("create future Namespace: %v", err)
 	}
+	recorder.waitForCount(t, "future", 1)
+	futureBefore := recorder.count("future")
 
-	configMap = invalidUpdate.DeepCopy()
-	configMap.Data[config.NamespaceKey] = "production,staging,future"
-	validUpdate, err := client.CoreV1().ConfigMaps(DefaultControllerNamespace).Update(
-		ctx,
-		configMap,
-		metav1.UpdateOptions{},
-	)
-	if err != nil {
+	configMap.Data[config.NamespaceKey] = "production,staging,retry,future"
+	if err := apiClient.Update(ctx, configMap); err != nil {
 		t.Fatalf("update valid ConfigMap: %v", err)
 	}
-	waitForConfigMapResourceVersion(t, resourceController, validUpdate.ResourceVersion)
-	eventually(t, 5*time.Second, func() bool {
+	eventually(t, 10*time.Second, func() bool {
 		snapshot, ok := store.Load()
 		return ok && snapshot.Generation == 2 && snapshot.MatchesNamespace("future")
-	}, "valid ConfigMap Watch update did not install generation 2")
-	recorder.waitForCount(t, "future", 1)
+	}, "valid ConfigMap update did not install generation 2")
+	recorder.waitForCount(t, "future", futureBefore+1)
 
-	if err := client.CoreV1().ConfigMaps(DefaultControllerNamespace).Delete(
-		ctx,
-		DefaultConfigMapName,
-		metav1.DeleteOptions{},
-	); err != nil {
-		t.Fatalf("delete ConfigMap: %v", err)
+	unrelated := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: DefaultControllerNamespace},
 	}
-	eventually(t, 5*time.Second, func() bool {
-		_, err := resourceController.configMapInformer.Lister().ConfigMaps(DefaultControllerNamespace).Get(DefaultConfigMapName)
-		return apierrors.IsNotFound(err)
-	}, "ConfigMap delete Watch event was not reflected in the informer cache")
+	if err := apiClient.Create(ctx, unrelated); err != nil {
+		t.Fatalf("create unrelated ConfigMap: %v", err)
+	}
+	if err := apiClient.Get(ctx, client.ObjectKeyFromObject(unrelated), &corev1.ConfigMap{}); err != nil {
+		t.Fatalf("direct client cannot read unrelated ConfigMap: %v", err)
+	}
+	if err := manager.GetClient().Get(ctx, client.ObjectKeyFromObject(unrelated), &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("cached client unrelated ConfigMap error = %v, want NotFound from fixed-name cache", err)
+	}
 
+	if err := apiClient.Delete(ctx, configMap); err != nil {
+		t.Fatalf("delete fixed ConfigMap: %v", err)
+	}
+	eventually(t, 10*time.Second, func() bool {
+		err := manager.GetClient().Get(ctx, configMapKey, &corev1.ConfigMap{})
+		return apierrors.IsNotFound(err)
+	}, "fixed ConfigMap deletion was not observed by the Manager cache")
 	afterDelete, ok := store.Load()
 	if !ok || afterDelete.Generation != 2 || !afterDelete.MatchesNamespace("future") {
 		t.Fatalf("ConfigMap deletion removed the last valid snapshot: %+v, present = %v", afterDelete, ok)
 	}
 }
 
-func waitForConfigMapResourceVersion(t *testing.T, resourceController *Controller, resourceVersion string) {
+func waitForCachedConfigMapResourceVersion(
+	t *testing.T,
+	kubernetesClient client.Client,
+	key client.ObjectKey,
+	resourceVersion string,
+) {
 	t.Helper()
-	eventually(t, 5*time.Second, func() bool {
-		configMap, err := resourceController.configMapInformer.Lister().
-			ConfigMaps(DefaultControllerNamespace).
-			Get(DefaultConfigMapName)
-		return err == nil && configMap.ResourceVersion == resourceVersion
-	}, "ConfigMap resourceVersion was not observed through Watch")
+	eventually(t, 10*time.Second, func() bool {
+		configMap := &corev1.ConfigMap{}
+		return kubernetesClient.Get(context.Background(), key, configMap) == nil &&
+			configMap.ResourceVersion == resourceVersion
+	}, "ConfigMap resourceVersion was not observed through the Manager cache")
+}
+
+func eventually(t *testing.T, timeout time.Duration, condition func() bool, failureMessage string) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if condition() {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal(failureMessage)
+		case <-ticker.C:
+		}
+	}
 }
 
 func repositoryRoot(t *testing.T) string {
