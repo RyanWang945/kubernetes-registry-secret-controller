@@ -12,6 +12,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -19,6 +20,9 @@ import (
 
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/controller"
+	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/credential"
+	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/registrysecret"
+	serviceaccountsyncer "github.com/RyanWang945/kubernetes-registry-secret-controller/internal/serviceaccount"
 )
 
 const (
@@ -87,10 +91,49 @@ func run(logger logr.Logger) error {
 	}
 
 	configStore := &config.Store{}
+	credentialStore := &credential.Store{}
+	resourceEvents, err := controller.NewResourceEventPublisher(mgr.GetClient())
+	if err != nil {
+		return fmt.Errorf("create resource event publisher: %w", err)
+	}
+	credentialScheduler, err := credential.NewScheduler(
+		configStore,
+		credentialStore,
+		credential.NewACRTokenProvider(),
+		resourceEvents,
+		clock.RealClock{},
+		credential.SchedulerOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("create credential scheduler: %w", err)
+	}
+	if err := mgr.Add(credentialScheduler); err != nil {
+		return fmt.Errorf("register credential scheduler: %w", err)
+	}
+	namespaceSecretSyncer, err := registrysecret.NewSyncer(
+		mgr.GetClient(),
+		configStore,
+		credentialStore,
+		controller.DefaultManagedSecretName,
+	)
+	if err != nil {
+		return fmt.Errorf("create namespace Secret syncer: %w", err)
+	}
+	serviceAccountSyncer, err := serviceaccountsyncer.NewSyncer(
+		mgr.GetClient(),
+		configStore,
+		controller.DefaultManagedSecretName,
+	)
+	if err != nil {
+		return fmt.Errorf("create ServiceAccount syncer: %w", err)
+	}
 	if err := controller.SetupWithManager(
 		mgr,
 		configStore,
-		controller.LoggingSyncer{},
+		credentialScheduler,
+		resourceEvents,
+		namespaceSecretSyncer,
+		serviceAccountSyncer,
 		controllerOptions,
 	); err != nil {
 		return fmt.Errorf("register controllers: %w", err)
@@ -109,6 +152,7 @@ func run(logger logr.Logger) error {
 		"config_name", controller.DefaultConfigMapName,
 		"managed_secret_name", controller.DefaultManagedSecretName,
 		"max_concurrent_namespace_reconciles", controller.DefaultMaxConcurrentNamespaceReconciles,
+		"max_concurrent_service_account_reconciles", controller.DefaultMaxConcurrentServiceAccountReconciles,
 		"leader_election", leaderElection,
 	)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {

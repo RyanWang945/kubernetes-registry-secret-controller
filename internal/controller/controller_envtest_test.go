@@ -22,6 +22,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
+	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/credential"
+	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/registrysecret"
+	serviceaccountsyncer "github.com/RyanWang945/kubernetes-registry-secret-controller/internal/serviceaccount"
 )
 
 // Envtest assets are released independently from Kubernetes patch releases.
@@ -88,13 +91,26 @@ func TestManagerInitialListAndContinuousWatch(t *testing.T) {
 
 	retryErr := errors.New("temporary sync failure")
 	store := &config.Store{}
-	recorder := newRecordingSyncer(func(call int, namespace string) error {
+	namespaceRecorder := newRecordingSyncer(func(call int, namespace string) error {
 		if namespace == "retry" && call == 1 {
 			return retryErr
 		}
 		return nil
 	})
-	if err := SetupWithManager(manager, store, recorder, ControllerOptions{}); err != nil {
+	serviceAccountRecorder := newRecordingSyncer(nil)
+	resourceEvents, err := NewResourceEventPublisher(manager.GetClient())
+	if err != nil {
+		t.Fatalf("NewResourceEventPublisher() error = %v", err)
+	}
+	if err := SetupWithManager(
+		manager,
+		store,
+		&recordingConfigurationObserver{},
+		resourceEvents,
+		namespaceRecorder,
+		serviceAccountRecorder,
+		ControllerOptions{},
+	); err != nil {
 		t.Fatalf("SetupWithManager() error = %v", err)
 	}
 
@@ -115,7 +131,7 @@ func TestManagerInitialListAndContinuousWatch(t *testing.T) {
 	if !manager.GetCache().WaitForCacheSync(ctx) {
 		t.Fatal("Manager cache did not synchronize")
 	}
-	recorder.waitForCount(t, "production", 1)
+	namespaceRecorder.waitForCount(t, "production", 1)
 	eventually(t, 10*time.Second, func() bool {
 		snapshot, ok := store.Load()
 		return ok && snapshot.Generation == 1
@@ -126,41 +142,48 @@ func TestManagerInitialListAndContinuousWatch(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create watched Namespace: %v", err)
 	}
-	recorder.waitForCount(t, "staging", 1)
+	namespaceRecorder.waitForCount(t, "staging", 1)
 
 	if err := apiClient.Create(ctx, &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: "retry"},
 	}); err != nil {
 		t.Fatalf("create retry Namespace: %v", err)
 	}
-	recorder.waitForCount(t, "retry", 2)
-	if recorder.successes("retry") != 1 {
-		t.Fatalf("successful retry reconciliations = %d, want 1", recorder.successes("retry"))
+	namespaceRecorder.waitForCount(t, "retry", 2)
+	if namespaceRecorder.successes("retry") != 1 {
+		t.Fatalf("successful retry reconciliations = %d, want 1", namespaceRecorder.successes("retry"))
 	}
 
-	productionBefore := recorder.count("production")
 	serviceAccount := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "production"},
 	}
+	productionBefore := namespaceRecorder.count("production")
 	if err := apiClient.Create(ctx, serviceAccount); err != nil {
 		t.Fatalf("create watched ServiceAccount: %v", err)
 	}
-	recorder.waitForCount(t, "production", productionBefore+1)
+	serviceAccountRecorder.waitForCount(t, "production/build", 1)
+	if namespaceRecorder.count("production") != productionBefore {
+		t.Fatal("ServiceAccount creation triggered namespace-wide reconciliation")
+	}
 
-	productionBefore = recorder.count("production")
+	serviceAccountBefore := serviceAccountRecorder.count("production/build")
 	serviceAccount.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "manually-added"}}
 	if err := apiClient.Update(ctx, serviceAccount); err != nil {
 		t.Fatalf("update watched ServiceAccount: %v", err)
 	}
-	recorder.waitForCount(t, "production", productionBefore+1)
+	serviceAccountRecorder.waitForCount(t, "production/build", serviceAccountBefore+1)
+	if namespaceRecorder.count("production") != productionBefore {
+		t.Fatal("ServiceAccount update triggered namespace-wide reconciliation")
+	}
 
-	productionBefore = recorder.count("production")
+	serviceAccountBefore = serviceAccountRecorder.count("production/build")
 	if err := apiClient.Create(ctx, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: DefaultManagedSecretName, Namespace: "production"},
 	}); err != nil {
 		t.Fatalf("create watched managed Secret: %v", err)
 	}
-	recorder.waitForCount(t, "production", productionBefore+1)
+	namespaceRecorder.waitForCount(t, "production", productionBefore+1)
+	serviceAccountRecorder.waitForCount(t, "production/build", serviceAccountBefore+1)
 
 	configMap := &corev1.ConfigMap{}
 	configMapKey := client.ObjectKey{Namespace: DefaultControllerNamespace, Name: DefaultConfigMapName}
@@ -182,8 +205,9 @@ func TestManagerInitialListAndContinuousWatch(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create future Namespace: %v", err)
 	}
-	recorder.waitForCount(t, "future", 1)
-	futureBefore := recorder.count("future")
+	namespaceRecorder.waitForCount(t, "future", 1)
+	futureBefore := namespaceRecorder.count("future")
+	serviceAccountBefore = serviceAccountRecorder.count("production/build")
 
 	configMap.Data[config.NamespaceKey] = "production,staging,retry,future"
 	if err := apiClient.Update(ctx, configMap); err != nil {
@@ -193,7 +217,71 @@ func TestManagerInitialListAndContinuousWatch(t *testing.T) {
 		snapshot, ok := store.Load()
 		return ok && snapshot.Generation == 2 && snapshot.MatchesNamespace("future")
 	}, "valid ConfigMap update did not install generation 2")
-	recorder.waitForCount(t, "future", futureBefore+1)
+	namespaceRecorder.waitForCount(t, "future", futureBefore+1)
+	serviceAccountRecorder.waitForCount(t, "production/build", serviceAccountBefore+1)
+
+	// Exercise the concrete resource syncers against a real API server. The
+	// Manager test uses recording syncers above to observe queue behavior, while
+	// these direct calls verify actual Secret Create and optimistic-lock SA Patch.
+	snapshot, _ := store.Load()
+	credentialStore := &credential.Store{}
+	for _, registry := range snapshot.Registries {
+		credentialStore.Apply(registry, credential.Credential{
+			Username:    "envtest-user",
+			Password:    "envtest-password",
+			RefreshedAt: time.Now().UTC(),
+			ExpiresAt:   time.Now().UTC().Add(time.Hour),
+		})
+	}
+	secretSyncer, err := registrysecret.NewSyncer(
+		manager.GetClient(),
+		store,
+		credentialStore,
+		DefaultManagedSecretName,
+	)
+	if err != nil {
+		t.Fatalf("create concrete Secret syncer: %v", err)
+	}
+	if err := secretSyncer.SyncNamespaceSecret(ctx, "future"); err != nil {
+		t.Fatalf("sync concrete Secret: %v", err)
+	}
+	eventually(t, 10*time.Second, func() bool {
+		secret := &corev1.Secret{}
+		return apiClient.Get(ctx, client.ObjectKey{Namespace: "future", Name: DefaultManagedSecretName}, secret) == nil &&
+			secret.Type == corev1.SecretTypeDockerConfigJson &&
+			registrysecret.IsManaged(secret)
+	}, "concrete Secret syncer did not create the managed dockerconfigjson Secret")
+
+	resourceServiceAccount := &corev1.ServiceAccount{
+		ObjectMeta:       metav1.ObjectMeta{Name: "build", Namespace: "future"},
+		ImagePullSecrets: []corev1.LocalObjectReference{{Name: "user-secret"}},
+	}
+	if err := apiClient.Create(ctx, resourceServiceAccount); err != nil {
+		t.Fatalf("create concrete-sync ServiceAccount: %v", err)
+	}
+	eventually(t, 10*time.Second, func() bool {
+		return manager.GetClient().Get(ctx, client.ObjectKeyFromObject(resourceServiceAccount), &corev1.ServiceAccount{}) == nil
+	}, "concrete-sync ServiceAccount was not observed through the Manager cache")
+	serviceAccountSyncer, err := serviceaccountsyncer.NewSyncer(
+		manager.GetClient(),
+		store,
+		DefaultManagedSecretName,
+	)
+	if err != nil {
+		t.Fatalf("create concrete ServiceAccount syncer: %v", err)
+	}
+	if err := serviceAccountSyncer.SyncServiceAccount(ctx, client.ObjectKeyFromObject(resourceServiceAccount)); err != nil {
+		t.Fatalf("sync concrete ServiceAccount: %v", err)
+	}
+	eventually(t, 10*time.Second, func() bool {
+		current := &corev1.ServiceAccount{}
+		if apiClient.Get(ctx, client.ObjectKeyFromObject(resourceServiceAccount), current) != nil {
+			return false
+		}
+		return len(current.ImagePullSecrets) == 2 &&
+			current.ImagePullSecrets[0].Name == "user-secret" &&
+			current.ImagePullSecrets[1].Name == DefaultManagedSecretName
+	}, "concrete ServiceAccount syncer did not preserve and inject imagePullSecrets")
 
 	unrelated := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: DefaultControllerNamespace},

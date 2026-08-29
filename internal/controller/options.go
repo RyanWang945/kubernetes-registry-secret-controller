@@ -12,23 +12,41 @@ import (
 )
 
 const (
-	DefaultControllerNamespace              = "registry-secret-controller-system"
-	DefaultConfigMapName                    = "registry-secret-controller-config"
-	DefaultManagedSecretName                = "auto-patch-secret"
-	DefaultMaxConcurrentNamespaceReconciles = 2
+	DefaultControllerNamespace                   = "registry-secret-controller-system"
+	DefaultConfigMapName                         = "registry-secret-controller-config"
+	DefaultManagedSecretName                     = "auto-patch-secret"
+	DefaultMaxConcurrentNamespaceReconciles      = 2
+	DefaultMaxConcurrentServiceAccountReconciles = 2
 
 	DefaultLeaderElectionID = "kubernetes-registry-secret-controller"
 
-	namespaceEventBuffer = 1024
+	controllerEventBuffer = 1024
 )
 
 // ControllerOptions contains the fixed Kubernetes object identities and the
 // bounded concurrency used by the controllers registered with one Manager.
 type ControllerOptions struct {
-	ControllerNamespace              string
-	ConfigMapName                    string
-	ManagedSecretName                string
+	// ControllerNamespace is the namespace containing the controller's fixed
+	// configuration ConfigMap. It does not determine the namespace in which the
+	// controller Pod runs or restrict which namespaces the controller manages.
+	ControllerNamespace string
+
+	// ConfigMapName is the name of the configuration ConfigMap read from
+	// ControllerNamespace.
+	ConfigMapName string
+
+	// ManagedSecretName is the name of the registry Secret created and maintained
+	// in each target namespace.
+	ManagedSecretName string
+
+	// MaxConcurrentNamespaceReconciles limits how many namespace Secret
+	// reconciliation requests may run concurrently; it does not limit the number
+	// of managed namespaces.
 	MaxConcurrentNamespaceReconciles int
+
+	// MaxConcurrentServiceAccountReconciles limits how many individual
+	// ServiceAccounts may be reconciled concurrently.
+	MaxConcurrentServiceAccountReconciles int
 }
 
 func (o ControllerOptions) withDefaults() ControllerOptions {
@@ -43,6 +61,9 @@ func (o ControllerOptions) withDefaults() ControllerOptions {
 	}
 	if o.MaxConcurrentNamespaceReconciles == 0 {
 		o.MaxConcurrentNamespaceReconciles = DefaultMaxConcurrentNamespaceReconciles
+	}
+	if o.MaxConcurrentServiceAccountReconciles == 0 {
+		o.MaxConcurrentServiceAccountReconciles = DefaultMaxConcurrentServiceAccountReconciles
 	}
 	return o
 }
@@ -61,6 +82,12 @@ func (o ControllerOptions) validate() error {
 		return fmt.Errorf(
 			"maximum concurrent namespace reconciles must be at least one, got %d",
 			o.MaxConcurrentNamespaceReconciles,
+		)
+	}
+	if o.MaxConcurrentServiceAccountReconciles < 1 {
+		return fmt.Errorf(
+			"maximum concurrent ServiceAccount reconciles must be at least one, got %d",
+			o.MaxConcurrentServiceAccountReconciles,
 		)
 	}
 	return nil

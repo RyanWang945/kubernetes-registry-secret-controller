@@ -2,9 +2,9 @@
 
 > 状态：Draft / 设计已收敛
 >
-> 版本：v0.4
+> 版本：v0.7
 >
-> 更新时间：2026-08-28
+> 更新时间：2026-08-29
 
 ## 1. 背景
 
@@ -35,7 +35,7 @@ Secret 中。
 2. 支持配置一个或多个 ACR 经济版或其他企业版实例；
 3. 每个实例节点自包含 Region、Instance ID、AK/SK 和 Domains；
 4. 每个目标 Namespace 只创建一个合并后的输出 Secret；
-5. 自动为目标 ServiceAccount 注入输出 Secret；
+5. 按 ServiceAccount 独立调谐并注入输出 Secret 引用；
 6. 每个 Registry 在集群中只维护一个当前期望凭据和一个刷新任务；
 7. 在 Token 过期前五分钟刷新，不进行固定周期全量取证；
 8. 新 Token 只获取一次，再有界并发分发到全部目标 Namespace；
@@ -147,17 +147,17 @@ RegistryKey 聚合实例，将所有有效 Registry 的 Domain 写入同一个
 当新 Namespace 匹配 namespace 配置时，Controller：
 
 1. 使用 Credential Store 中的当前凭据创建 auto-patch-secret；
-2. 将该 Secret 注入目标 ServiceAccount；
-3. 不重新调用 ACR；
-4. 不创建新的 Registry 刷新任务。
+2. 不重新调用 ACR；
+3. 不创建新的 Registry 刷新任务。
 
 ### 3.4 新增 ServiceAccount
 
-当新 ServiceAccount 匹配 serviceaccount 配置时，Controller 立即追加
-auto-patch-secret 引用，不调用 ACR。
+ServiceAccount Controller 按 Namespace/Name 独立调谐。匹配配置且输出
+Secret 已存在时，立即追加 auto-patch-secret 引用，不调用 ACR。
 
 一期不修改 Pod。Kubernetes 只在 Pod 创建时从 ServiceAccount 复制
-imagePullSecrets，因此 Pod 必须在 ServiceAccount 完成注入后创建。
+imagePullSecrets。Namespace 创建后尽快创建 Secret 能缩小竞态窗口，但不
+保证异步注入先于 Pod 创建；工作负载必须在 ServiceAccount 完成注入后创建，
 已经创建且缺少引用的 Pod 需要重新创建。
 
 ### 3.5 自动刷新
@@ -214,22 +214,25 @@ flowchart TB
     Owner[Cluster Owner] --> Config[固定 ConfigMap]
     Manager[controller-runtime Manager] --> Cache[Shared Cache and Client]
     Manager --> ConfigController[Configuration Controller<br/>所有副本]
-    Manager --> NamespaceController[Namespace Controller<br/>仅 Leader 调谐]
+    Manager --> NamespaceController[Namespace Secret Controller<br/>仅 Leader 调谐]
+    Manager --> ServiceAccountController[ServiceAccount Controller<br/>仅 Leader 调谐]
     Manager --> LeaderRuntime[Leader Runtime<br/>恢复与凭据调度]
     Cache --> ConfigController
     Cache --> NamespaceController
+    Cache --> ServiceAccountController
     Config --> ConfigController
     ConfigController --> ConfigStore[Configuration Store]
-    ConfigController --> NamespaceController
+    ConfigStore --> NamespaceController
+    ConfigStore --> ServiceAccountController
     LeaderRuntime --> TokenQueue[Credential Queue]
     TokenQueue --> ACR[ACR GetAuthorizationToken]
     ACR --> CredentialStore[Credential Store]
     CredentialStore --> NamespaceController
-    NamespaceController --> SecretA[ns-a / auto-patch-secret]
-    NamespaceController --> SecretB[ns-b / auto-patch-secret]
-    NamespaceController --> SA[ServiceAccounts]
-    SecretA --> Kubelet[Kubelet]
-    SecretB --> Kubelet
+    NamespaceController --> Secrets[目标 Namespace / auto-patch-secret]
+    Secrets --> ServiceAccountController
+    ServiceAccountController --> SA[ServiceAccounts]
+    SA --> Kubelet[Kubelet]
+    Secrets --> Kubelet
     Kubelet --> Registry[ACR Registry]
 ~~~
 
@@ -238,15 +241,15 @@ flowchart TB
 - Manager：统一管理 Cache、Client、Controller、Leader Election、Metrics、
   健康检查和优雅退出；
 - Configuration Controller：所有副本读取、校验、规范化并热更新固定 ConfigMap；
-- Namespace Controller：将 Namespace、ServiceAccount、输出 Secret 和内部配置
-  事件映射到以 Namespace 为 Key 的 Reconcile Queue；
+- Namespace Secret Controller：以 Namespace 为 Key，只负责输出 Secret；
+- ServiceAccount Controller：以 Namespace/Name 为 Key，只负责固定
+  imagePullSecrets 引用；
 - Leader Runtime：在获得 Leader 身份后按顺序执行状态恢复并启动凭据调度；
 - Credential Store：保存每个 RegistryKey 的当前期望凭据；
 - Credential Scheduler：按 expiresAt 管理 Registry 延迟任务和失败重试；
 - ACR Token Provider：使用实例节点内的 AK/SK 调用 ACR API；
 - Secret Builder：生成完整 Docker Config 和 State；
-- Resource Syncer：幂等同步 Namespace、Secret 和 ServiceAccount；并发由
-  Namespace Controller 控制；
+- Secret Syncer：幂等创建、更新、修复和清理输出 Secret；
 - Observability：日志、Event、Metrics 和健康检查。
 
 Manager 是进程级生命周期边界。不得在 main 中另行启动不受 Manager 管理的
@@ -405,7 +408,8 @@ map[RegistryKey]RegistryConfig
 | 刷新提前量 | 5m |
 | Jitter | 无 |
 | Credential Worker | 2 |
-| Namespace 最大并发 Reconcile | 2 |
+| Namespace Secret 最大并发 Reconcile | 2 |
+| ServiceAccount 最大并发 Reconcile | 2 |
 | Controller Pod 副本 | 2 |
 | Leader 写入者 | 1 |
 
@@ -435,20 +439,20 @@ type RegistryKey struct {
     InstanceID string
 }
 
-type CredentialRequest struct {
+type Request struct {
     Key             RegistryKey
     AccessKeyID     string
     AccessKeySecret string
 }
 
-type Credential struct {
+type Token struct {
     Username  string
-    Token     string
+    Password  string
     ExpiresAt time.Time
 }
 
 type TokenProvider interface {
-    GetCredential(ctx context.Context, req CredentialRequest) (Credential, error)
+    GetAuthorizationToken(ctx context.Context, req Request) (Token, error)
 }
 ~~~
 
@@ -457,7 +461,7 @@ type TokenProvider interface {
 - ACR Endpoint 根据 regionID 构造；
 - 每次刷新一个 RegistryKey 只调用一次 GetAuthorizationToken；
 - RefreshedAt 由 Controller 在 API 成功返回并完成响应校验后使用当前时钟生成；
-- 同一个 RegistryKey 通过 WorkQueue Key 去重和 Keyed Lock 防止并发取证；
+- 同一个 RegistryKey 由 WorkQueue 去重，同一时刻只交给一个 Worker；
 - 外部请求必须设置超时；
 - 校验返回值完整且 ExpiresAt 晚于当前时间和刷新安全窗口；
 - SDK 调试日志默认关闭；
@@ -586,10 +590,9 @@ Create/Update 中提交。
 时必须结束进程，由 Pod 重启后重新参与选举；不在同一进程中重置并再次
 启动一套 Worker。
 
-Leader Runtime、Credential Scheduler 和 Namespace Controller 都属于
-Leader-only 组件，但 Manager 不保证它们的业务启动顺序。因此 Leader
-Runtime 在恢复完成后打开 recovery gate；Namespace Reconcile 在 gate
-打开前不写资源，并在 gate 打开时由 Leader Runtime 触发一次全量入队。
+Leader Runtime、Credential Scheduler 和两个资源 Controller 都属于
+Leader-only 组件。Leader Runtime 在恢复完成后打开 recovery gate；资源
+Controller 在 gate 打开前不写资源，并在打开后执行积压调谐。
 
 ### 8.1 初始 List
 
@@ -615,7 +618,7 @@ namespace 配置为准。同一 Cache 持续 Watch 该固定名称的 Secret。
 11. 将恢复结果写入 Credential Store；
 12. 已到 refreshAt 或没有候选的 Registry 立即加入 Credential Queue；
 13. 其他 Registry 通过 AddAfter 安排到 refreshAt；
-14. 将全部目标 Namespace 加入 Namespace Reconcile Queue。
+14. 将全部目标 Namespace 加入 Secret Reconcile Queue。
 
 仍在当前配置中但没有有效候选的 Registry 标记为 Pending，并立即取证。
 Pending 不等同于已删除；在取得替代凭据前，资源同步不得从已有受管
@@ -656,20 +659,22 @@ queue.AddRateLimited(key)
 两个 Credential Worker 有界并发执行：
 
 1. 从队列取得 RegistryKey；
-2. 读取最新规范化配置和配置 Generation；
+2. 读取最新规范化配置；
 3. 判断 Registry 是否仍存在；
 4. 重新计算并检查 refreshAt；
 5. 陈旧或提前唤醒的任务重新安排，不调用 ACR；
-6. 获取 Keyed Lock；
-7. 使用该节点的 AK/SK 调用一次 GetAuthorizationToken；
-8. 校验新凭据；
-9. 原子更新 Credential Store，使新凭据成为当前期望凭据；
-10. 为全部目标 Namespace 发布 Namespace Reconcile 请求；
-11. Forget 当前失败退避；
-12. 按新 ExpiresAt 安排下一次刷新。
+6. 使用该节点的 AK/SK 调用一次 GetAuthorizationToken；
+7. 再次检查 AK/SK，丢弃配置变化期间返回的陈旧响应；
+8. 校验并原子更新 Credential Store；
+9. 为全部目标 Namespace 发布 Secret Reconcile 请求；
+10. Forget 当前失败退避；
+11. 按新 ExpiresAt 安排下一次刷新。
 
 如果配置把刷新时间推迟，旧任务可以提前唤醒；Worker 二次检查后重新
 AddAfter。Registry 被删除后，旧任务成为无操作。
+
+AK/SK 变化会标记强制刷新，不受旧 Token 剩余有效期影响。凭据已写入
+Credential Store 后如果 Namespace 事件发布失败，只重试发布，不再次调用 ACR。
 
 ### 9.3 失败退避
 
@@ -688,88 +693,52 @@ Provider 失败退避：
 - 单个 Registry 失败不阻塞其他 Registry；
 - 不存在固定五分钟或其他周期的全量 Registry 扫描。
 
-## 10. Namespace 资源同步
+## 10. 资源调谐
 
-### 10.1 Namespace Reconcile Queue
+### 10.1 Namespace Secret Controller
 
-队列 Key 是 Namespace 名称。Namespace Controller 使用 controller-runtime
-的 RateLimiting Queue，并通过 MaxConcurrentReconciles 将并发固定为 2；
-不自行管理 Worker 生命周期。
+队列 Key 是 Namespace 名称，最多并发两个 Reconcile。每次读取最新
+Credential Store 快照并只调谐该 Namespace 的 auto-patch-secret；多个事件
+由队列按 Key 合并。
 
-一次同步读取 Credential Store 的最新完整快照，构建该 Namespace 的
-完整期望 Secret。队列任务不携带某次 Token，避免排队期间旧任务覆盖
-更新的凭据。
+- 不存在时创建；受管且漂移时更新；符合期望时不写；
+- 同名 Secret 只有两个 Controller 身份标签都匹配时才更新或删除，否则不覆盖；
+- Registry 已删除时移除对应 Auth；仍在配置但 Pending 时保留旧 Auth；
+- Namespace 离开目标范围时只删除明确受管的 Secret；
+- 使用 resourceVersion 冲突重试，失败只重试该 Namespace，不重新调用 ACR。
 
-如果 Registry A 和 B 同时刷新，它们会添加相同 Namespace Key。
-Queue 对 Key 去重；Reconcile 执行时读取包含 A、B 最新状态的快照。
+固定名称 Secret 的初始 List 和持续 Watch 同时用于恢复、漂移检测和调谐。
 
-### 10.2 Secret 同步
+### 10.2 ServiceAccount Controller
 
-对目标 Namespace：
+队列 Key 是 ServiceAccount 的 Namespace/Name，独立有界并发，不由 Namespace
+Reconcile 扫描全部 ServiceAccount。
 
-1. 输出 Secret 不存在时创建；
-2. 已存在且由本 Controller 管理时比较并更新；
-3. 内容和 State 已符合期望时不写入；
-4. 同名但不受管时不覆盖并报告 OwnershipConflict；
-5. 使用 resourceVersion 冲突重试；
-6. 单个 Namespace 失败时独立退避；
-7. 分发失败不重新调用 ACR。
+- 匹配配置时，先确认受管 Secret 已存在，再确保固定引用恰好一次；
+- Secret 尚未创建时短暂重试；Secret 创建事件立即入队该 Namespace 的目标
+  ServiceAccount；
+- 配置变化时全量入队 ServiceAccount，以完成新增目标注入和旧目标清理；
+- 保留其他 imagePullSecrets，使用 resourceVersion 冲突重试；
+- 固定名称引用是 Controller 保留项，离开目标范围时移除；
+- 固定名称 Secret 发生所有权冲突时不注入，并清理 Controller 保留引用；
+- 不创建 ServiceAccount，也不修改 Pod。
 
-Secret Builder 必须区分以下两种情况：
+### 10.3 Pod 创建时序
 
-- RegistryKey 已从有效配置删除：删除其 Auth 和 State；
-- RegistryKey 仍在配置中但处于 Pending：已有受管 Secret 保留该
-  Registry 当前的旧 Auth 和 State，新 Namespace 暂时不包含该 Registry。
-
-因此，一个 Registry 暂时取证失败时，其他 Registry 的成功同步不会把
-它的旧凭据从现有 Namespace 中顺带删除。新凭据取得后再统一替换并收敛。
-
-当 Namespace 离开目标范围时，只删除明确受管的 auto-patch-secret，并
-清理目标 ServiceAccount 中的保留引用。
-
-### 10.3 ServiceAccount 同步
-
-Secret 创建或更新成功后再处理 ServiceAccount：
-
-- 保留其他名称的 imagePullSecrets；
-- 确保 auto-patch-secret 引用只出现一次；
-- auto-patch-secret 名称及其目标 SA 引用视为 Controller 保留资源；
-- 使用 resourceVersion 冲突重试；
-- ServiceAccount 离开目标范围时移除该固定引用；
-- ServiceAccount 不存在时等待其创建事件，不创建 ServiceAccount；
-- 不修改 Pod 自己显式设置的 imagePullSecrets。
-
-### 10.4 全量监听和收敛
-
-Manager Cache 对固定名称 Secret 执行初始 List 和持续 Watch：
-
-~~~text
-metadata.name=auto-patch-secret
-~~~
-
-Watch 的目的包括：
-
-- 发现删除和漂移；
-- 发现某个 Namespace 仍持有旧 stateHash；
-- 在 Leader 启动时提供恢复候选；
-- 驱动各 Namespace 最终收敛。
-
-Secret Watch 不为每个 Secret 创建刷新任务。若某个 Namespace 持有旧
-expiresAt，只将该 Namespace 加入 Namespace Reconcile Queue，不调用 ACR。
-
-Controller 自己的 Secret Update 也会触发 Watch。Namespace Reconcile 发现
-stateHash 和内容已一致后成为无操作，不形成写入循环。
+Namespace 事件优先创建 Secret，可显著缩小 Secret、ServiceAccount 和 Pod
+同时创建时的竞态，但异步 Controller 不提供顺序保证。Pod 必须在
+ServiceAccount 引用就绪后创建；严格保证需要 Admission Webhook，不属于一期。
 
 ## 11. 事件映射
 
 | 事件 | 动作 |
 | --- | --- |
-| ConfigMap 更新 | 所有副本校验并原子更新 Store；全量入队 Namespace |
+| ConfigMap 更新 | 原子更新 Store；全量入队 Namespace 和 ServiceAccount |
 | ConfigMap 删除 | 继续使用最后一份有效配置，不清理 |
-| Namespace 进入目标范围 | 同步 Secret 和 ServiceAccount |
-| Namespace 离开目标范围 | 清理受管 Secret 和固定 SA 引用 |
-| ServiceAccount 创建或变化 | 入队所在 Namespace |
-| 输出 Secret 删除或漂移 | 入队所在 Namespace |
+| Namespace 进入或离开目标范围 | 入队该 Namespace，同步或清理 Secret |
+| ServiceAccount 创建或变化 | 入队该 ServiceAccount |
+| 输出 Secret 创建 | 入队该 Namespace 的目标 ServiceAccount |
+| 输出 Secret 删除或漂移 | 入队所在 Namespace，修复 Secret |
 | 输出 Secret 已符合期望 | 无操作 |
 | Registry 到达 refreshAt | 调用一次 ACR 并入队全部目标 Namespace |
 
@@ -781,10 +750,8 @@ Secret。
 Configuration Controller 每次都先完整解析和规范化新配置，再原子替换当前配置。
 不允许应用半份配置。
 
-每次成功处理有效 ConfigMap 后都全量入队 Namespace，而不只在 Store 首次
-返回 Changed 时入队。这样即使 Store 已更新后 Namespace List 或事件发布
-暂时失败，标准 Controller 重试仍能完成 fan-out。配置更新频率低，优先
-保证幂等收敛，不维护一次性的命令式新旧配置差异队列。
+每次成功处理有效 ConfigMap 后都全量入队 Namespace 和 ServiceAccount。
+配置更新频率低，使用幂等全量收敛，不维护一次性的新旧差异队列。
 
 | 配置差异 | 动作 |
 | --- | --- |
@@ -795,12 +762,12 @@ Configuration Controller 每次都先完整解析和规范化新配置，再原�
 | Registry 数组顺序变化 | 无操作 |
 | Domain 顺序变化 | 无操作 |
 | namespace 新增目标 | 使用当前凭据同步，不取证 |
-| namespace 删除目标 | 清理受管 Secret 和固定 SA 引用 |
+| namespace 删除目标 | 删除受管 Secret；ServiceAccount Controller 清理固定引用 |
 | serviceaccount 新增目标 | 注入固定引用 |
 | serviceaccount 删除目标 | 移除固定引用 |
 
-启动时配置无效则 Readiness 失败；Namespace Reconcile 不执行资源同步，
-Credential Worker 也不启动。运行中收到无效配置或 ConfigMap 删除事件时，
+启动时配置无效则 Readiness 失败；资源 Controller 不执行写入，Credential
+Worker 也不启动。运行中收到无效配置或 ConfigMap 删除事件时，
 保留最后一份有效配置、Credential Store 和输出 Secret，并报告
 InvalidConfiguration。
 
@@ -812,9 +779,10 @@ InvalidConfiguration。
 - controller-runtime Manager 的 Leader Election 保证只有一个写入者；
 - Configuration Controller 在所有副本运行；
 - Leader 内部运行两个 Credential Worker；
-- Namespace Controller 在 Leader 内最多并发执行两个 Reconcile；
+- Namespace Secret Controller 和 ServiceAccount Controller 各最多并发两个
+  Reconcile；
 - 同一个 RegistryKey 不并发取证；
-- 同一个 Namespace 不并发同步；
+- 同一个 Namespace Secret 和同一个 ServiceAccount 不并发同步；
 - 不为每个 Namespace 无限制创建 Goroutine。
 
 ### 13.2 部分分发
@@ -836,15 +804,13 @@ ACR 返回 T2
 
 ### 13.3 Leader 切换
 
-Follower 运行 Configuration Controller 以保持 ConfigMap Cache 和本地配置
-快照更新，并通过 Namespace Controller 的 source warmup 保持 Namespace、
-ServiceAccount、固定名称 Secret Cache 以及 Reconcile Queue 更新，但不执行
-Namespace Reconcile。
+Follower 运行 Configuration Controller 以保持本地配置快照更新。两个资源
+Controller 使用 source warmup 保持 Cache 和 Queue 更新，但不执行写入。
 获得 Leader 身份后必须执行第 8 节的完整恢复流程，打开 recovery gate 后
 才允许调度和资源同步。
 
-EnableWarmup 只用于 Namespace Controller，并由 HA 测试覆盖；其他组件不
-依赖这一 beta 能力。Manager 在非预期丢失 Lease 后返回错误，进程随即退出。
+EnableWarmup 仅用于两个资源 Controller，并由 HA 测试覆盖。Manager 在
+非预期丢失 Lease 后返回错误，进程随即退出。
 
 如果多个 Secret 存在不同版本，按 RegistryKey 选择最新有效候选，不按
 Namespace 多数表决，也不使用读到的第一个 Secret。
@@ -979,13 +945,14 @@ Kubernetes 资源同步结果。
 资源同步：
 
 - 一百个 Namespace 仍只获取一次 Registry Token；
-- Namespace Reconcile Queue 按 Key 去重；
-- Reconcile 读取最新完整 Credential Store 快照；
+- Namespace Secret Queue 和 ServiceAccount Queue 分别按 Key 去重；
+- Secret Reconcile 读取最新完整 Credential Store 快照；
 - Secret 删除和漂移后恢复；
 - 同名非受管 Secret 不覆盖；
+- ServiceAccount 事件只调谐该对象，不扫描整个 Namespace；
+- Secret 不存在时不注入引用，创建事件触发目标 ServiceAccount；
 - 保留 SA 的其他 imagePullSecrets；
 - auto-patch-secret 引用不重复；
-- SA 不存在时等待创建事件；
 - Namespace 离开范围后清理受管资源。
 
 恢复：
@@ -1005,17 +972,18 @@ Kubernetes 资源同步结果。
 1. 启动真实 Manager 后，ConfigMap 初始 List 完成配置同步；
 2. 新 Namespace 进入目标范围后创建 auto-patch-secret；
 3. Namespace 离开范围后清理受管 Secret 和 SA 引用；
-4. ServiceAccount 创建后注入引用；
-5. Secret 删除或漂移后自动修复；
-6. 同名非受管 Secret 返回所有权冲突；
-7. 多 Registry 写入同一个 Secret；
-8. AK/SK 更新只刷新对应 Registry；
-9. Domain 更新复用当前 Token；
-10. Registry 删除准确清理 Auth；
-11. 无效热更新和 ConfigMap 删除保留上一份有效配置；
-12. Provider 和 Kubernetes API 错误分别重试；
-13. Pending Registry 的旧 Auth 在其他 Registry 更新时得到保留；
-14. Leader 退出后新 Leader 恢复部分分发状态。
+4. ServiceAccount 创建后仅调谐该对象并注入引用；
+5. Secret 尚未创建时不注入，Secret 创建后自动重试；
+6. Secret 删除或漂移后自动修复；
+7. 同名非受管 Secret 返回所有权冲突；
+8. 多 Registry 写入同一个 Secret；
+9. AK/SK 更新只刷新对应 Registry；
+10. Domain 更新复用当前 Token；
+11. Registry 删除准确清理 Auth；
+12. 无效热更新和 ConfigMap 删除保留上一份有效配置；
+13. Provider 和 Kubernetes API 错误分别重试；
+14. Pending Registry 的旧 Auth 在其他 Registry 更新时得到保留；
+15. Leader 退出后新 Leader 恢复部分分发状态。
 
 Manager 集成测试关闭监听端口和 Leader Election，使用真实 API Server 验证
 精确 Cache、初始 List、持续 Watch、标准 Queue 重试和优雅停止。双副本
@@ -1052,12 +1020,11 @@ Leader Election、warmup 和恢复顺序在 Kind 测试中验证。
 7. 一个 Registry 在集群中只有一份当前期望凭据和一个刷新任务；
 8. 一百个 Namespace 对同一 Registry 只产生一次 Token 获取；
 9. Token 在过期前五分钟刷新；
-10. 两个 Credential Worker 和 Namespace Controller 的两个并发 Reconcile
-    实现有界并发；
+10. Credential、Namespace Secret 和 ServiceAccount 调谐均有界并发；
 11. Controller 重启后能从最新有效 Secret 副本恢复；
 12. 部分分发后不按多数回滚到旧凭据；
 13. Secret 删除或漂移后自动修复；
-14. ServiceAccount 保留其他引用并正确追加固定 Secret；
+14. ServiceAccount 独立调谐，保留其他引用并正确追加固定 Secret；
 15. 不存在固定周期全量扫描；
 16. 配置错误、Provider 错误、资源冲突和凭据过期均可观测；
 17. 日志、Event 和 Metrics 不泄露 AK/SK 或临时 Token。
