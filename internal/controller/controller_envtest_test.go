@@ -221,47 +221,56 @@ func TestManagerInitialListAndContinuousWatch(t *testing.T) {
 	serviceAccountRecorder.waitForCount(t, "production/build", serviceAccountBefore+1)
 
 	// Exercise the concrete resource syncers against a real API server. The
-	// Manager test uses recording syncers above to observe queue behavior, while
-	// these direct calls verify actual Secret Create and optimistic-lock SA Patch.
+	// Manager uses recording syncers above to observe queue behavior, while these
+	// direct calls verify the cache-backed readiness gate and actual SA Patch.
 	snapshot, _ := store.Load()
 	credentialStore := &credential.Store{}
-	for _, registry := range snapshot.Registries {
-		credentialStore.Apply(registry, credential.Credential{
-			Username:    "envtest-user",
-			Password:    "envtest-password",
-			RefreshedAt: time.Now().UTC(),
-			ExpiresAt:   time.Now().UTC().Add(time.Hour),
-		})
-	}
 	secretSyncer, err := registrysecret.NewSyncer(
 		manager.GetClient(),
 		store,
 		credentialStore,
 		DefaultManagedSecretName,
+		manager.GetEventRecorderFor("envtest-namespace-secrets"),
 	)
 	if err != nil {
 		t.Fatalf("create concrete Secret syncer: %v", err)
 	}
 	if err := secretSyncer.SyncNamespaceSecret(ctx, "future"); err != nil {
-		t.Fatalf("sync concrete Secret: %v", err)
+		t.Fatalf("sync concrete Secret without credentials: %v", err)
 	}
-	eventually(t, 10*time.Second, func() bool {
-		secret := &corev1.Secret{}
-		return apiClient.Get(ctx, client.ObjectKey{Namespace: "future", Name: DefaultManagedSecretName}, secret) == nil &&
-			secret.Type == corev1.SecretTypeDockerConfigJson &&
-			registrysecret.IsManaged(secret)
-	}, "concrete Secret syncer did not create the managed dockerconfigjson Secret")
+	secretKey := client.ObjectKey{Namespace: "future", Name: DefaultManagedSecretName}
+	if err := apiClient.Get(ctx, secretKey, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("empty managed Secret error = %v, want NotFound", err)
+	}
 
-	resourceServiceAccount := &corev1.ServiceAccount{
+	waitingServiceAccount := &corev1.ServiceAccount{
 		ObjectMeta:       metav1.ObjectMeta{Name: "build", Namespace: "future"},
 		ImagePullSecrets: []corev1.LocalObjectReference{{Name: "user-secret"}},
 	}
-	if err := apiClient.Create(ctx, resourceServiceAccount); err != nil {
-		t.Fatalf("create concrete-sync ServiceAccount: %v", err)
+	stableServiceAccount := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "future"},
+		ImagePullSecrets: []corev1.LocalObjectReference{
+			{Name: "user-secret"},
+			{Name: DefaultManagedSecretName},
+		},
 	}
-	eventually(t, 10*time.Second, func() bool {
-		return manager.GetClient().Get(ctx, client.ObjectKeyFromObject(resourceServiceAccount), &corev1.ServiceAccount{}) == nil
-	}, "concrete-sync ServiceAccount was not observed through the Manager cache")
+	waitingBefore := serviceAccountRecorder.count("future/build")
+	stableBefore := serviceAccountRecorder.count("future/default")
+	for _, serviceAccount := range []*corev1.ServiceAccount{waitingServiceAccount, stableServiceAccount} {
+		if err := apiClient.Create(ctx, serviceAccount); err != nil {
+			t.Fatalf("create concrete-sync ServiceAccount %s: %v", client.ObjectKeyFromObject(serviceAccount), err)
+		}
+		eventually(t, 10*time.Second, func() bool {
+			return manager.GetClient().Get(
+				ctx,
+				client.ObjectKeyFromObject(serviceAccount),
+				&corev1.ServiceAccount{},
+			) == nil
+		}, "concrete-sync ServiceAccount was not observed through the Manager cache")
+	}
+	serviceAccountRecorder.waitForCount(t, "future/build", waitingBefore+1)
+	serviceAccountRecorder.waitForCount(t, "future/default", stableBefore+1)
+
 	serviceAccountSyncer, err := serviceaccountsyncer.NewSyncer(
 		manager.GetClient(),
 		store,
@@ -270,18 +279,89 @@ func TestManagerInitialListAndContinuousWatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create concrete ServiceAccount syncer: %v", err)
 	}
-	if err := serviceAccountSyncer.SyncServiceAccount(ctx, client.ObjectKeyFromObject(resourceServiceAccount)); err != nil {
+	for _, serviceAccount := range []*corev1.ServiceAccount{waitingServiceAccount, stableServiceAccount} {
+		if err := serviceAccountSyncer.SyncServiceAccount(
+			ctx,
+			client.ObjectKeyFromObject(serviceAccount),
+		); !errors.Is(err, serviceaccountsyncer.ErrManagedSecretNotReady) {
+			t.Fatalf("sync ServiceAccount %s without Secret error = %v, want ErrManagedSecretNotReady", client.ObjectKeyFromObject(serviceAccount), err)
+		}
+	}
+	if !serviceAccountHasReferences(ctx, apiClient, client.ObjectKeyFromObject(waitingServiceAccount), "user-secret") {
+		t.Fatal("missing Secret changed the waiting ServiceAccount references")
+	}
+	if !serviceAccountHasReferences(
+		ctx,
+		apiClient,
+		client.ObjectKeyFromObject(stableServiceAccount),
+		"user-secret",
+		DefaultManagedSecretName,
+	) {
+		t.Fatal("missing Secret removed the stable managed reference")
+	}
+
+	for _, registry := range snapshot.Registries {
+		credentialStore.Apply(registry, credential.Credential{
+			Username:    "envtest-user",
+			Password:    "envtest-password",
+			RefreshedAt: time.Now().UTC(),
+			ExpiresAt:   time.Now().UTC().Add(time.Hour),
+		})
+	}
+	waitingBeforeSecret := serviceAccountRecorder.count("future/build")
+	stableBeforeSecret := serviceAccountRecorder.count("future/default")
+	if err := secretSyncer.SyncNamespaceSecret(ctx, "future"); err != nil {
+		t.Fatalf("sync concrete Secret: %v", err)
+	}
+	eventually(t, 10*time.Second, func() bool {
+		secret := &corev1.Secret{}
+		return apiClient.Get(ctx, secretKey, secret) == nil &&
+			secret.Type == corev1.SecretTypeDockerConfigJson &&
+			registrysecret.IsManaged(secret)
+	}, "concrete Secret syncer did not create the managed dockerconfigjson Secret")
+	serviceAccountRecorder.waitForCount(t, "future/build", waitingBeforeSecret+1)
+	serviceAccountRecorder.waitForCount(t, "future/default", stableBeforeSecret+1)
+
+	waitingBeforePatch := serviceAccountRecorder.count("future/build")
+	if err := serviceAccountSyncer.SyncServiceAccount(ctx, client.ObjectKeyFromObject(waitingServiceAccount)); err != nil {
 		t.Fatalf("sync concrete ServiceAccount: %v", err)
 	}
 	eventually(t, 10*time.Second, func() bool {
-		current := &corev1.ServiceAccount{}
-		if apiClient.Get(ctx, client.ObjectKeyFromObject(resourceServiceAccount), current) != nil {
-			return false
-		}
-		return len(current.ImagePullSecrets) == 2 &&
-			current.ImagePullSecrets[0].Name == "user-secret" &&
-			current.ImagePullSecrets[1].Name == DefaultManagedSecretName
+		return serviceAccountHasReferences(
+			ctx,
+			apiClient,
+			client.ObjectKeyFromObject(waitingServiceAccount),
+			"user-secret",
+			DefaultManagedSecretName,
+		)
 	}, "concrete ServiceAccount syncer did not preserve and inject imagePullSecrets")
+	serviceAccountRecorder.waitForCount(t, "future/build", waitingBeforePatch+1)
+
+	managedSecret := &corev1.Secret{}
+	if err := apiClient.Get(ctx, secretKey, managedSecret); err != nil {
+		t.Fatalf("get managed Secret for event predicate checks: %v", err)
+	}
+	ordinaryUpdateCount := serviceAccountRecorder.count("future/build")
+	managedSecret.Data[corev1.DockerConfigJsonKey] = []byte(`{"auths":{"registry.example.com":{}}}`)
+	if err := apiClient.Update(ctx, managedSecret); err != nil {
+		t.Fatalf("update managed Secret data: %v", err)
+	}
+	waitForCachedSecretResourceVersion(t, manager.GetClient(), secretKey, managedSecret.ResourceVersion)
+	time.Sleep(200 * time.Millisecond)
+	if got := serviceAccountRecorder.count("future/build"); got != ordinaryUpdateCount {
+		t.Fatalf("ordinary Secret update reconciliations = %d, want unchanged %d", got, ordinaryUpdateCount)
+	}
+
+	delete(managedSecret.Labels, registrysecret.ManagedByLabelKey)
+	if err := apiClient.Update(ctx, managedSecret); err != nil {
+		t.Fatalf("remove managed Secret ownership label: %v", err)
+	}
+	serviceAccountRecorder.waitForCount(t, "future/build", ordinaryUpdateCount+1)
+	managedSecret.Labels[registrysecret.ManagedByLabelKey] = registrysecret.ControllerIdentity
+	if err := apiClient.Update(ctx, managedSecret); err != nil {
+		t.Fatalf("restore managed Secret ownership label: %v", err)
+	}
+	serviceAccountRecorder.waitForCount(t, "future/build", ordinaryUpdateCount+2)
 
 	unrelated := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: DefaultControllerNamespace},
@@ -321,6 +401,38 @@ func waitForCachedConfigMapResourceVersion(
 		return kubernetesClient.Get(context.Background(), key, configMap) == nil &&
 			configMap.ResourceVersion == resourceVersion
 	}, "ConfigMap resourceVersion was not observed through the Manager cache")
+}
+
+func waitForCachedSecretResourceVersion(
+	t *testing.T,
+	kubernetesClient client.Client,
+	key client.ObjectKey,
+	resourceVersion string,
+) {
+	t.Helper()
+	eventually(t, 10*time.Second, func() bool {
+		secret := &corev1.Secret{}
+		return kubernetesClient.Get(context.Background(), key, secret) == nil &&
+			secret.ResourceVersion == resourceVersion
+	}, "Secret resourceVersion was not observed through the Manager cache")
+}
+
+func serviceAccountHasReferences(
+	ctx context.Context,
+	kubernetesClient client.Client,
+	key client.ObjectKey,
+	expected ...string,
+) bool {
+	serviceAccount := &corev1.ServiceAccount{}
+	if err := kubernetesClient.Get(ctx, key, serviceAccount); err != nil || len(serviceAccount.ImagePullSecrets) != len(expected) {
+		return false
+	}
+	for index, name := range expected {
+		if serviceAccount.ImagePullSecrets[index].Name != name {
+			return false
+		}
+	}
+	return true
 }
 
 func eventually(t *testing.T, timeout time.Duration, condition func() bool, failureMessage string) {

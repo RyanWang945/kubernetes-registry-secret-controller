@@ -3,6 +3,7 @@ package registrysecret
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -31,7 +33,13 @@ func TestSyncerCreatesRepairsAndDeletesManagedSecret(t *testing.T) {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "production"}},
 	).Build()
 	recorder := &recordingClient{Client: baseClient}
-	syncer, err := NewSyncer(recorder, configStore, credentialStore, "auto-patch-secret")
+	syncer, err := NewSyncer(
+		recorder,
+		configStore,
+		credentialStore,
+		"auto-patch-secret",
+		record.NewFakeRecorder(10),
+	)
 	if err != nil {
 		t.Fatalf("NewSyncer() error = %v", err)
 	}
@@ -103,7 +111,14 @@ func TestSyncerDoesNotOverwriteUnownedSecretOrCreateInMissingNamespace(t *testin
 		unowned,
 	).Build()
 	recorder := &recordingClient{Client: baseClient}
-	syncer, err := NewSyncer(recorder, configStore, &credential.Store{}, "auto-patch-secret")
+	eventRecorder := record.NewFakeRecorder(10)
+	syncer, err := NewSyncer(
+		recorder,
+		configStore,
+		&credential.Store{},
+		"auto-patch-secret",
+		eventRecorder,
+	)
 	if err != nil {
 		t.Fatalf("NewSyncer() error = %v", err)
 	}
@@ -114,6 +129,14 @@ func TestSyncerDoesNotOverwriteUnownedSecretOrCreateInMissingNamespace(t *testin
 	current := getSecret(t, baseClient, "production", "auto-patch-secret")
 	if string(current.Data["user-data"]) != "preserve" || recorder.updateCount() != 0 {
 		t.Fatal("unowned Secret was modified")
+	}
+	select {
+	case recorded := <-eventRecorder.Events:
+		if !strings.Contains(recorded, "Warning OwnershipConflict") {
+			t.Fatalf("ownership conflict event = %q, want Warning OwnershipConflict", recorded)
+		}
+	default:
+		t.Fatal("ownership conflict did not produce a Warning Event")
 	}
 
 	if err := syncer.SyncNamespaceSecret(context.Background(), "missing"); err != nil {
@@ -141,6 +164,7 @@ func TestSyncerNamespaceFailuresAreIndependent(t *testing.T) {
 		configStore,
 		credentialStore,
 		"auto-patch-secret",
+		record.NewFakeRecorder(10),
 	)
 	if err != nil {
 		t.Fatalf("NewSyncer() error = %v", err)
@@ -155,6 +179,59 @@ func TestSyncerNamespaceFailuresAreIndependent(t *testing.T) {
 	getSecret(t, baseClient, "healthy", "auto-patch-secret")
 	if err := baseClient.Get(context.Background(), client.ObjectKey{Namespace: "broken", Name: "auto-patch-secret"}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("broken Namespace Secret error = %v, want NotFound", err)
+	}
+}
+
+func TestSyncerDoesNotKeepAnEmptyManagedSecret(t *testing.T) {
+	t.Parallel()
+
+	registry := testRegistry("cn-hangzhou", "cri-a", "key", "secret", "a.example.com")
+	configStore := &config.Store{}
+	configStore.Apply(testSnapshot(registry))
+	baseClient := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "production"}},
+	).Build()
+	recorder := &recordingClient{Client: baseClient}
+	syncer, err := NewSyncer(
+		recorder,
+		configStore,
+		&credential.Store{},
+		"auto-patch-secret",
+		record.NewFakeRecorder(10),
+	)
+	if err != nil {
+		t.Fatalf("NewSyncer() error = %v", err)
+	}
+
+	if err := syncer.SyncNamespaceSecret(context.Background(), "production"); err != nil {
+		t.Fatalf("initial SyncNamespaceSecret() error = %v", err)
+	}
+	key := client.ObjectKey{Namespace: "production", Name: "auto-patch-secret"}
+	if err := baseClient.Get(context.Background(), key, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("Secret without credentials error = %v, want NotFound", err)
+	}
+	if recorder.createCount() != 0 {
+		t.Fatalf("empty Secret creates = %d, want 0", recorder.createCount())
+	}
+
+	emptyContent, err := Build(testSnapshot(registry), nil, nil)
+	if err != nil {
+		t.Fatalf("Build() empty content error = %v", err)
+	}
+	if emptyContent.HasAuth() {
+		t.Fatal("empty content unexpectedly reports Docker auth")
+	}
+	if err := baseClient.Create(context.Background(), newSecret(key, emptyContent)); err != nil {
+		t.Fatalf("create legacy empty managed Secret: %v", err)
+	}
+	if err := syncer.SyncNamespaceSecret(context.Background(), "production"); err != nil {
+		t.Fatalf("cleanup empty SyncNamespaceSecret() error = %v", err)
+	}
+	if err := baseClient.Get(context.Background(), key, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("legacy empty Secret after cleanup error = %v, want NotFound", err)
+	}
+	if recorder.deleteCount() != 1 {
+		t.Fatalf("empty Secret deletes = %d, want 1", recorder.deleteCount())
 	}
 }
 
@@ -215,6 +292,12 @@ func (c *recordingClient) updateCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.updates
+}
+
+func (c *recordingClient) deleteCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deletes
 }
 
 type failNamespaceCreateClient struct {

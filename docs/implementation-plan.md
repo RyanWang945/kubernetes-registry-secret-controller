@@ -58,6 +58,15 @@
 - [x] 实现固定名称输出 Secret 的漂移修复。
 - [x] 编写 Secret/ServiceAccount 独立调谐、冲突重试和部分 Namespace 失败测试。
 
+## 已完成：ServiceAccount 的受管 Secret 校验
+
+- [x] Secret Builder 尚未取得任何凭据时不创建空 Secret。
+- [x] ServiceAccount 新增固定引用前校验 Secret 存在、未在删除、明确受管、Type 正确且 `.dockerconfigjson` 非空。
+- [x] Secret 暂时不可用时不新增引用、不移除已有引用，并交由 Controller 限速重试。
+- [x] Secret Create 和受管身份变化唤醒相关 ServiceAccount；普通 Token/Data Update 不扇出。
+- [x] 所有权冲突由 Namespace Secret Controller 集中记录 Error 日志和 Warning Event。
+- [x] 补充单元测试和 envtest，覆盖暂时不可用、稳定引用、事件唤醒及正常轮换不 Patch SA。
+
 ## 下一里程碑：恢复、高可用与可观测性
 
 - [ ] 实现从受管 Secret 按 RegistryKey 恢复最新有效凭证。

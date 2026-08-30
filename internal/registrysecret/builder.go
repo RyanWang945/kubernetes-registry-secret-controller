@@ -50,6 +50,14 @@ type RegistryState struct {
 type Content struct {
 	DockerJSON []byte
 	StateJSON  string
+	hasAuth    bool
+}
+
+// HasAuth reports whether the rendered Docker config contains at least one
+// registry credential. A target namespace must not receive an empty managed
+// Secret while all configured registries are still pending.
+func (c Content) HasAuth() bool {
+	return c.hasAuth
 }
 
 // Build creates deterministic Docker auth and state documents from one atomic
@@ -98,7 +106,11 @@ func Build(
 	if err != nil {
 		return Content{}, fmt.Errorf("marshal registry state: %w", err)
 	}
-	return Content{DockerJSON: dockerJSON, StateJSON: string(stateJSON)}, nil
+	return Content{
+		DockerJSON: dockerJSON,
+		StateJSON:  string(stateJSON),
+		hasAuth:    len(dockerConfig.Auths) > 0,
+	}, nil
 }
 
 func addCredential(

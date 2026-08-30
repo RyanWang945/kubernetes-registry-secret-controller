@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
+	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/registrysecret"
 )
 
 // SetupWithManager registers the always-on configuration controller and the
@@ -88,7 +89,7 @@ func SetupWithManager(
 				store,
 				options.ManagedSecretName,
 			)),
-			builder.WithPredicates(createOnlyPredicate()),
+			builder.WithPredicates(serviceAccountSecretPredicate()),
 		).
 		WatchesRawSource(source.Channel(resourceEvents.serviceAccountEvents, &handler.EnqueueRequestForObject{})).
 		WithOptions(controllerRuntime.Options{
@@ -164,11 +165,15 @@ func mapManagedSecretToServiceAccounts(
 	}
 }
 
-func createOnlyPredicate() predicate.Funcs {
+func serviceAccountSecretPredicate() predicate.Funcs {
 	return predicate.Funcs{
-		CreateFunc:  func(event.CreateEvent) bool { return true },
-		DeleteFunc:  func(event.DeleteEvent) bool { return false },
-		UpdateFunc:  func(event.UpdateEvent) bool { return false },
+		CreateFunc: func(event.CreateEvent) bool { return true },
+		DeleteFunc: func(event.DeleteEvent) bool { return false },
+		UpdateFunc: func(update event.UpdateEvent) bool {
+			oldSecret, oldOK := update.ObjectOld.(*corev1.Secret)
+			newSecret, newOK := update.ObjectNew.(*corev1.Secret)
+			return oldOK && newOK && registrysecret.IsManaged(oldSecret) != registrysecret.IsManaged(newSecret)
+		},
 		GenericFunc: func(event.GenericEvent) bool { return false },
 	}
 }

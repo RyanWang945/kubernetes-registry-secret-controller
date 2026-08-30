@@ -9,11 +9,15 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/registrysecret"
 )
+
+// ErrManagedSecretNotReady is retryable. It leaves every existing
+// imagePullSecrets reference untouched while the fixed managed Secret is
+// absent, deleting, or structurally incomplete.
+var ErrManagedSecretNotReady = errors.New("managed Secret is not ready")
 
 type Syncer struct {
 	client      client.Client
@@ -54,14 +58,14 @@ func (s *Syncer) SyncServiceAccount(ctx context.Context, key types.NamespacedNam
 		secretKey := client.ObjectKey{Namespace: key.Namespace, Name: s.secretName}
 		if err := s.client.Get(ctx, secretKey, secret); err != nil {
 			if apierrors.IsNotFound(err) {
-				return fmt.Errorf("managed Secret %s is not ready", secretKey)
+				return fmt.Errorf("%w: %s does not exist", ErrManagedSecretNotReady, secretKey)
 			}
 			return fmt.Errorf("get managed Secret %s: %w", secretKey, err)
 		}
 		if !registrysecret.IsManaged(secret) {
-			conflict := fmt.Errorf("Secret %s exists but is not owned by this controller", secretKey)
-			log.FromContext(ctx).Error(conflict, "cannot inject registry Secret reference")
 			shouldReference = false
+		} else if !registrysecret.IsUsableForServiceAccount(secret) {
+			return fmt.Errorf("%w: %s is deleting or structurally incomplete", ErrManagedSecretNotReady, secretKey)
 		}
 	}
 

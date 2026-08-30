@@ -153,7 +153,9 @@ RegistryKey 聚合实例，将所有有效 Registry 的 Domain 写入同一个
 ### 3.4 新增 ServiceAccount
 
 ServiceAccount Controller 按 Namespace/Name 独立调谐。匹配配置且输出
-Secret 已存在时，立即追加 auto-patch-secret 引用，不调用 ACR。
+Secret 已存在、未处于删除状态、明确受管且具有最小合法结构时，立即追加
+auto-patch-secret 引用，不调用 ACR。Secret 暂时不可用时不新增引用、保留已有引用，
+并通过限速队列重试；Secret Create 事件用于立即唤醒等待首次注入的对象。
 
 一期不修改 Pod。Kubernetes 只在 Pod 创建时从 ServiceAccount 复制
 imagePullSecrets。Namespace 创建后尽快创建 Secret 能缩小竞态窗口，但不
@@ -209,32 +211,10 @@ ServiceAccount 引用继续保留，直到用户按文档手工清理。
 
 ## 4. 总体架构
 
-~~~mermaid
-flowchart TB
-    Owner[Cluster Owner] --> Config[固定 ConfigMap]
-    Manager[controller-runtime Manager] --> Cache[Shared Cache and Client]
-    Manager --> ConfigController[Configuration Controller<br/>所有副本]
-    Manager --> NamespaceController[Namespace Secret Controller<br/>仅 Leader 调谐]
-    Manager --> ServiceAccountController[ServiceAccount Controller<br/>仅 Leader 调谐]
-    Manager --> LeaderRuntime[Leader Runtime<br/>恢复与凭据调度]
-    Cache --> ConfigController
-    Cache --> NamespaceController
-    Cache --> ServiceAccountController
-    Config --> ConfigController
-    ConfigController --> ConfigStore[Configuration Store]
-    ConfigStore --> NamespaceController
-    ConfigStore --> ServiceAccountController
-    LeaderRuntime --> TokenQueue[Credential Queue]
-    TokenQueue --> ACR[ACR GetAuthorizationToken]
-    ACR --> CredentialStore[Credential Store]
-    CredentialStore --> NamespaceController
-    NamespaceController --> Secrets[目标 Namespace / auto-patch-secret]
-    Secrets --> ServiceAccountController
-    ServiceAccountController --> SA[ServiceAccounts]
-    SA --> Kubelet[Kubelet]
-    Secrets --> Kubelet
-    Kubelet --> Registry[ACR Registry]
-~~~
+![Kubernetes Registry Secret Controller 架构](./architecture.png)
+
+图中组件边界和核心调用链的文字说明见
+[Controller 架构与核心时序](./architecture.md)。
 
 内部模块：
 
@@ -557,9 +537,8 @@ type RegistryState struct {
 
 ### 7.3 stateHash
 
-每个 Registry 只保存一个 stateHash，不再区分 configHash 和 authHash。
-stateHash 使用 SHA-256 校验配置、状态和 Docker Auth 是否一致，不作为
-安全签名。
+每个 Registry 保存一个 stateHash。stateHash 使用 SHA-256 校验配置、状态和
+Docker Auth 是否一致，不作为安全签名。
 
 Hash 输入使用确定性 Canonical JSON，包含：
 
@@ -702,6 +681,7 @@ Credential Store 快照并只调谐该 Namespace 的 auto-patch-secret；多个�
 由队列按 Key 合并。
 
 - 不存在时创建；受管且漂移时更新；符合期望时不写；
+- 尚未取得任何凭据时不创建空 Secret；
 - 同名 Secret 只有两个 Controller 身份标签都匹配时才更新或删除，否则不覆盖；
 - Registry 已删除时移除对应 Auth；仍在配置但 Pending 时保留旧 Auth；
 - Namespace 离开目标范围时只删除明确受管的 Secret；
@@ -714,13 +694,15 @@ Credential Store 快照并只调谐该 Namespace 的 auto-patch-secret；多个�
 队列 Key 是 ServiceAccount 的 Namespace/Name，独立有界并发，不由 Namespace
 Reconcile 扫描全部 ServiceAccount。
 
-- 匹配配置时，先确认受管 Secret 已存在，再确保固定引用恰好一次；
-- Secret 尚未创建时短暂重试；Secret 创建事件立即入队该 Namespace 的目标
-  ServiceAccount；
+- 匹配配置且需要首次新增引用时，通过 Cache 确认固定名称 Secret 已存在、未在删除、
+  两个 Controller 身份标签匹配、Type 正确且 `.dockerconfigjson` 非空；
+- Secret 尚未创建、正在删除或结构暂不完整时，不新增引用且不移除已有引用，并返回
+  可重试错误；Secret 创建事件立即入队该 Namespace 的目标 ServiceAccount；
 - 配置变化时全量入队 ServiceAccount，以完成新增目标注入和旧目标清理；
 - 保留其他 imagePullSecrets，使用 resourceVersion 冲突重试；
 - 固定名称引用是 Controller 保留项，离开目标范围时移除；
 - 固定名称 Secret 发生所有权冲突时不注入，并清理 Controller 保留引用；
+- Token 轮换、过期或受管 Secret 的短暂重建不触发已有引用的移除和重新添加；
 - 不创建 ServiceAccount，也不修改 Pod。
 
 ### 10.3 Pod 创建时序
@@ -738,6 +720,7 @@ ServiceAccount 引用就绪后创建；严格保证需要 Admission Webhook，�
 | Namespace 进入或离开目标范围 | 入队该 Namespace，同步或清理 Secret |
 | ServiceAccount 创建或变化 | 入队该 ServiceAccount |
 | 输出 Secret 创建 | 入队该 Namespace 的目标 ServiceAccount |
+| 输出 Secret 受管身份变化 | 入队该 Namespace 的目标 ServiceAccount |
 | 输出 Secret 删除或漂移 | 入队所在 Namespace，修复 Secret |
 | 输出 Secret 已符合期望 | 无操作 |
 | Registry 到达 refreshAt | 调用一次 ACR 并入队全部目标 Namespace |
@@ -951,6 +934,8 @@ Kubernetes 资源同步结果。
 - 同名非受管 Secret 不覆盖；
 - ServiceAccount 事件只调谐该对象，不扫描整个 Namespace；
 - Secret 不存在时不注入引用，创建事件触发目标 ServiceAccount；
+- Secret 暂时不存在、删除中或结构不完整时保留已有固定引用并限速重试；
+- 正常 Token 轮换不扇出或 Patch ServiceAccount；
 - 保留 SA 的其他 imagePullSecrets；
 - auto-patch-secret 引用不重复；
 - Namespace 离开范围后清理受管资源。

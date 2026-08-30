@@ -81,8 +81,8 @@ func TestSyncerAppendsReferenceOnlyAfterManagedSecretExists(t *testing.T) {
 	}
 	key := types.NamespacedName{Namespace: "production", Name: "build"}
 
-	if err := syncer.SyncServiceAccount(context.Background(), key); err == nil {
-		t.Fatal("SyncServiceAccount() without Secret error = nil, want retryable not-ready error")
+	if err := syncer.SyncServiceAccount(context.Background(), key); !errors.Is(err, ErrManagedSecretNotReady) {
+		t.Fatalf("SyncServiceAccount() without Secret error = %v, want ErrManagedSecretNotReady", err)
 	}
 	assertReferences(t, getServiceAccount(t, baseClient, key))
 
@@ -93,6 +93,65 @@ func TestSyncerAppendsReferenceOnlyAfterManagedSecretExists(t *testing.T) {
 		t.Fatalf("SyncServiceAccount() after Secret creation error = %v", err)
 	}
 	assertReferences(t, getServiceAccount(t, baseClient, key), managedSecretName)
+}
+
+func TestSyncerPreservesExistingReferenceWhileManagedSecretIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	deleting := managedSecret("production")
+	deletionTimestamp := metav1.Now()
+	deleting.DeletionTimestamp = &deletionTimestamp
+	deleting.Finalizers = []string{"test.example/finalizer"}
+
+	wrongType := managedSecret("production")
+	wrongType.Type = corev1.SecretTypeOpaque
+
+	emptyData := managedSecret("production")
+	emptyData.Data[corev1.DockerConfigJsonKey] = nil
+
+	tests := []struct {
+		name   string
+		secret *corev1.Secret
+	}{
+		{name: "missing"},
+		{name: "deleting", secret: deleting},
+		{name: "wrong type", secret: wrongType},
+		{name: "empty data", secret: emptyData},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			configStore := &config.Store{}
+			configStore.Apply(testConfiguration("production", "build"))
+			objects := []client.Object{&corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{Name: "build", Namespace: "production"},
+				ImagePullSecrets: []corev1.LocalObjectReference{
+					{Name: "user-secret"},
+					{Name: managedSecretName},
+				},
+			}}
+			if test.secret != nil {
+				objects = append(objects, test.secret)
+			}
+			baseClient := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objects...).Build()
+			recorder := &recordingPatchClient{Client: baseClient}
+			syncer, err := NewSyncer(recorder, configStore, managedSecretName)
+			if err != nil {
+				t.Fatalf("NewSyncer() error = %v", err)
+			}
+			key := types.NamespacedName{Namespace: "production", Name: "build"}
+
+			if err := syncer.SyncServiceAccount(context.Background(), key); !errors.Is(err, ErrManagedSecretNotReady) {
+				t.Fatalf("SyncServiceAccount() error = %v, want ErrManagedSecretNotReady", err)
+			}
+			assertReferences(t, getServiceAccount(t, baseClient, key), "user-secret", managedSecretName)
+			if recorder.patchCount() != 0 {
+				t.Fatalf("ServiceAccount patches = %d, want 0", recorder.patchCount())
+			}
+		})
+	}
 }
 
 func TestSyncerDoesNotReferenceUnownedSecret(t *testing.T) {
@@ -161,14 +220,18 @@ func testConfiguration(namespace, serviceAccount string) config.ConfigurationSna
 }
 
 func managedSecret(namespace string) *corev1.Secret {
-	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
-		Name:      managedSecretName,
-		Namespace: namespace,
-		Labels: map[string]string{
-			registrysecret.ApplicationNameLabelKey: registrysecret.ControllerIdentity,
-			registrysecret.ManagedByLabelKey:       registrysecret.ControllerIdentity,
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      managedSecretName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				registrysecret.ApplicationNameLabelKey: registrysecret.ControllerIdentity,
+				registrysecret.ManagedByLabelKey:       registrysecret.ControllerIdentity,
+			},
 		},
-	}}
+		Type: corev1.SecretTypeDockerConfigJson,
+		Data: map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{"registry.example.com":{}}}`)},
+	}
 }
 
 func testScheme(t *testing.T) *runtime.Scheme {

@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -21,6 +22,7 @@ type Syncer struct {
 	configStore     *config.Store
 	credentialStore *credential.Store
 	secretName      string
+	eventRecorder   record.EventRecorder
 }
 
 func NewSyncer(
@@ -28,6 +30,7 @@ func NewSyncer(
 	configStore *config.Store,
 	credentialStore *credential.Store,
 	secretName string,
+	eventRecorder record.EventRecorder,
 ) (*Syncer, error) {
 	if kubernetesClient == nil {
 		return nil, errors.New("Kubernetes client must not be nil")
@@ -41,11 +44,15 @@ func NewSyncer(
 	if secretName == "" {
 		return nil, errors.New("managed Secret name must not be empty")
 	}
+	if eventRecorder == nil {
+		return nil, errors.New("event recorder must not be nil")
+	}
 	return &Syncer{
 		client:          kubernetesClient,
 		configStore:     configStore,
 		credentialStore: credentialStore,
 		secretName:      secretName,
+		eventRecorder:   eventRecorder,
 	}, nil
 }
 
@@ -83,6 +90,14 @@ func (s *Syncer) SyncNamespaceSecret(ctx context.Context, namespace string) erro
 	if err == nil && !IsManaged(current) {
 		conflict := fmt.Errorf("Secret %s exists but is not owned by this controller", key)
 		log.FromContext(ctx).Error(conflict, "cannot manage registry Secret")
+		s.eventRecorder.Eventf(
+			current,
+			corev1.EventTypeWarning,
+			"OwnershipConflict",
+			"Secret %s already exists and is not managed by %s",
+			key,
+			ControllerIdentity,
+		)
 		return nil
 	}
 
@@ -93,6 +108,15 @@ func (s *Syncer) SyncNamespaceSecret(ctx context.Context, namespace string) erro
 	content, buildErr := Build(snapshot, s.credentialStore.Snapshot(), existing)
 	if buildErr != nil {
 		return fmt.Errorf("build managed Secret %s: %w", key, buildErr)
+	}
+	if !content.HasAuth() {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err := s.client.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete empty managed Secret %s: %w", key, err)
+		}
+		return nil
 	}
 
 	if apierrors.IsNotFound(err) {
@@ -117,6 +141,17 @@ func IsManaged(secret *corev1.Secret) bool {
 	return secret != nil &&
 		secret.Labels[ApplicationNameLabelKey] == ControllerIdentity &&
 		secret.Labels[ManagedByLabelKey] == ControllerIdentity
+}
+
+// IsUsableForServiceAccount performs the small, cache-friendly validation
+// needed before a ServiceAccount first references the fixed Secret name.
+// Namespace Secret reconciliation remains responsible for full content
+// correctness and drift repair.
+func IsUsableForServiceAccount(secret *corev1.Secret) bool {
+	return IsManaged(secret) &&
+		secret.DeletionTimestamp == nil &&
+		secret.Type == corev1.SecretTypeDockerConfigJson &&
+		len(secret.Data[corev1.DockerConfigJsonKey]) > 0
 }
 
 func newSecret(key client.ObjectKey, content Content) *corev1.Secret {

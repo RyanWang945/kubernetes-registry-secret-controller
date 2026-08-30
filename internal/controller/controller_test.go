@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
+	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/registrysecret"
 )
 
 const testRegistries = `
@@ -344,14 +345,32 @@ func TestEventMappersKeepNamespaceAndServiceAccountKeysSeparate(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "production"},
 	}))
 
-	createOnly := createOnlyPredicate()
+	secretEvents := serviceAccountSecretPredicate()
 	managedSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 		Name:      DefaultManagedSecretName,
 		Namespace: "production",
+		Labels: map[string]string{
+			registrysecret.ApplicationNameLabelKey: registrysecret.ControllerIdentity,
+			registrysecret.ManagedByLabelKey:       registrysecret.ControllerIdentity,
+		},
 	}}
-	if !createOnly.Create(event.CreateEvent{Object: managedSecret}) ||
-		createOnly.Update(event.UpdateEvent{ObjectOld: managedSecret, ObjectNew: managedSecret}) {
-		t.Fatal("managed Secret predicate must admit creates and reject updates")
+	unmanagedSecret := managedSecret.DeepCopy()
+	delete(unmanagedSecret.Labels, registrysecret.ManagedByLabelKey)
+	rotatedSecret := managedSecret.DeepCopy()
+	rotatedSecret.Data = map[string][]byte{corev1.DockerConfigJsonKey: []byte("rotated")}
+
+	if !secretEvents.Create(event.CreateEvent{Object: managedSecret}) {
+		t.Fatal("managed Secret predicate rejected create")
+	}
+	if secretEvents.Update(event.UpdateEvent{ObjectOld: managedSecret, ObjectNew: rotatedSecret}) {
+		t.Fatal("managed Secret predicate admitted ordinary data update")
+	}
+	if !secretEvents.Update(event.UpdateEvent{ObjectOld: managedSecret, ObjectNew: unmanagedSecret}) ||
+		!secretEvents.Update(event.UpdateEvent{ObjectOld: unmanagedSecret, ObjectNew: managedSecret}) {
+		t.Fatal("managed Secret predicate rejected ownership transition")
+	}
+	if secretEvents.Delete(event.DeleteEvent{Object: managedSecret}) {
+		t.Fatal("managed Secret predicate admitted delete")
 	}
 }
 

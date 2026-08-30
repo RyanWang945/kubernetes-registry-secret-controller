@@ -115,6 +115,7 @@ func run(logger logr.Logger) error {
 		configStore,
 		credentialStore,
 		controller.DefaultManagedSecretName,
+		mgr.GetEventRecorderFor("namespace-secrets"),
 	)
 	if err != nil {
 		return fmt.Errorf("create namespace Secret syncer: %w", err)
