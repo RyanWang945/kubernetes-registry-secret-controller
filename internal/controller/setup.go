@@ -63,7 +63,7 @@ func SetupWithManager(
 
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("namespace_secrets").
-		For(&corev1.Namespace{}).
+		Watches(&corev1.Namespace{}, &namespaceEventHandler{}).
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(mapManagedSecretToNamespace(options.ManagedSecretName)),
@@ -73,6 +73,7 @@ func SetupWithManager(
 			MaxConcurrentReconciles: options.MaxConcurrentNamespaceReconciles,
 			NeedLeaderElection:      ptr.To(true),
 			EnableWarmup:            ptr.To(true),
+			UsePriorityQueue:         ptr.To(true),
 		}).
 		Complete(namespaceReconciler); err != nil {
 		return fmt.Errorf("register namespace Secret controller: %w", err)

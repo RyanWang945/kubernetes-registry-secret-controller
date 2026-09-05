@@ -148,7 +148,12 @@ RegistryKey 聚合实例，将所有有效 Registry 的 Domain 写入同一个
 
 1. 使用 Credential Store 中的当前凭据创建 auto-patch-secret；
 2. 不重新调用 ACR；
-3. 不创建新的 Registry 刷新任务。
+3. 不创建新的 Registry 刷新任务；
+4. 对运行期间 Watch 到的 Namespace Create 使用高优先级队列项，使其在
+   Token 到期全量分发期间先于尚未执行的普通分发项调谐。
+
+高优先级不抢占已经运行的 Reconcile，也不绕过 Kubernetes 客户端限速，
+因此缩短排队时间但不承诺同步完成。启动时 Informer 初始 List 不视为实时新增。
 
 ### 3.4 新增 ServiceAccount
 
@@ -676,9 +681,15 @@ Provider 失败退避：
 
 ### 10.1 Namespace Secret Controller
 
-队列 Key 是 Namespace 名称，最多并发两个 Reconcile。每次读取最新
-Credential Store 快照并只调谐该 Namespace 的 auto-patch-secret；多个事件
-由队列按 Key 合并。
+队列 Key 是 Namespace 名称，默认最多并发两个 Reconcile，部署时可通过参数
+调整。每次读取最新 Credential Store 快照并只调谐该 Namespace 的
+auto-patch-secret；多个事件由队列按 Key 合并。
+
+运行期间 Watch 到的 Namespace Create 使用优先级 100；到期或配置全量分发、
+实际 Namespace Update/Delete 和 Secret 修复使用默认优先级 0；Informer 初始
+List 以及 resourceVersion 未改变的 Resync 沿用 controller-runtime 的低优先级
+-100。同一个 Key 已在低优先级等待时，实时 Create 将该 Key 原地提升而不产生
+重复项。优先级队列显式启用。
 
 - 不存在时创建；受管且漂移时更新；符合期望时不写；
 - 尚未取得任何凭据时不创建空 Secret；
@@ -717,7 +728,8 @@ ServiceAccount 引用就绪后创建；严格保证需要 Admission Webhook，�
 | --- | --- |
 | ConfigMap 更新 | 原子更新 Store；全量入队 Namespace 和 ServiceAccount |
 | ConfigMap 删除 | 继续使用最后一份有效配置，不清理 |
-| Namespace 进入或离开目标范围 | 入队该 Namespace，同步或清理 Secret |
+| 实时 Namespace Create | 以高优先级入队该 Namespace，同步 Secret |
+| Namespace 更新、删除或配置范围变化 | 以普通优先级入队该 Namespace，同步或清理 Secret |
 | ServiceAccount 创建或变化 | 入队该 ServiceAccount |
 | 输出 Secret 创建 | 入队该 Namespace 的目标 ServiceAccount |
 | 输出 Secret 受管身份变化 | 入队该 Namespace 的目标 ServiceAccount |
@@ -762,8 +774,8 @@ InvalidConfiguration。
 - controller-runtime Manager 的 Leader Election 保证只有一个写入者；
 - Configuration Controller 在所有副本运行；
 - Leader 内部运行两个 Credential Worker；
-- Namespace Secret Controller 和 ServiceAccount Controller 各最多并发两个
-  Reconcile；
+- Namespace Secret Controller 和 ServiceAccount Controller 默认各最多并发两个
+  Reconcile，可分别通过部署参数有界调整；
 - 同一个 RegistryKey 不并发取证；
 - 同一个 Namespace Secret 和同一个 ServiceAccount 不并发同步；
 - 不为每个 Namespace 无限制创建 Goroutine。
@@ -929,6 +941,9 @@ Kubernetes 资源同步结果。
 
 - 一百个 Namespace 仍只获取一次 Registry Token；
 - Namespace Secret Queue 和 ServiceAccount Queue 分别按 Key 去重；
+- 实时 Namespace Create 先于普通全量分发项出队；
+- 初始 List 保持低优先级，已排队的同 Namespace Key 能被实时 Create 原地提升；
+- 禁用优先队列时 Namespace Create 仍能按普通队列兼容入队；
 - Secret Reconcile 读取最新完整 Credential Store 快照；
 - Secret 删除和漂移后恢复；
 - 同名非受管 Secret 不覆盖；
@@ -970,6 +985,10 @@ Kubernetes 资源同步结果。
 14. Pending Registry 的旧 Auth 在其他 Registry 更新时得到保留；
 15. Leader 退出后新 Leader 恢复部分分发状态。
 
+此外使用优先队列单元测试验证实时 Create、初始 List、同 Key 提级和普通队列
+回退语义；受控性能测试在到期全量分发期间注入新 Namespace，验证当前代凭据、
+ServiceAccount 就绪时间以及对原全量分发吞吐的影响。
+
 Manager 集成测试关闭监听端口和 Leader Election，使用真实 API Server 验证
 精确 Cache、初始 List、持续 Watch、标准 Queue 重试和优雅停止。双副本
 Leader Election、warmup 和恢复顺序在 Kind 测试中验证。
@@ -990,6 +1009,7 @@ Leader Election、warmup 和恢复顺序在 Kind 测试中验证。
 - 删除或修改 Secret 后验证恢复；
 - 在部分 Namespace 分发成功时重启 Leader；
 - 同时安排多个 Registry 到期并验证并发上限；
+- 在大规模到期分发中创建 Namespace，验证其优先调谐且不暴露旧凭据；
 - 扩展 Namespace 数量并确认 Provider 调用次数不随 Namespace 增长。
 
 真实 ACR 测试不得在日志或 CI Artifact 中输出 AK/SK 或临时 Token。
@@ -1012,7 +1032,8 @@ Leader Election、warmup 和恢复顺序在 Kind 测试中验证。
 14. ServiceAccount 独立调谐，保留其他引用并正确追加固定 Secret；
 15. 不存在固定周期全量扫描；
 16. 配置错误、Provider 错误、资源冲突和凭据过期均可观测；
-17. 日志、Event 和 Metrics 不泄露 AK/SK 或临时 Token。
+17. 日志、Event 和 Metrics 不泄露 AK/SK 或临时 Token；
+18. 实时 Namespace Create 在普通全量分发积压时优先出队，且仍使用当前凭据。
 
 ## 19. 发布与运维
 
@@ -1029,6 +1050,12 @@ Leader Election、warmup 和恢复顺序在 Kind 测试中验证。
 Deployment 固定 replicas: 2，并启用 Leader Election。滚动升级期间只有
 一个 Leader 执行取证和写入。生产启动参数保持 --leader-elect=true；本地
 开发和单进程测试可显式设置 --leader-elect=false。
+
+Kubernetes API 客户端限流可通过 `--kube-api-qps` 和 `--kube-api-burst`
+配置；Namespace Secret 与 ServiceAccount 调谐并发分别通过
+`--max-concurrent-namespace-reconciles` 和
+`--max-concurrent-service-account-reconciles` 配置。默认值保持 client-go
+兼容的 QPS 5、Burst 10，以及两类 Controller 各 2 个并发 Worker。
 
 卸载步骤：
 

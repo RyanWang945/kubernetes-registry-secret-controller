@@ -1,9 +1,12 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"os"
 	"time"
 
@@ -30,7 +33,20 @@ const (
 	defaultMetricsAddress   = ":8080"
 	defaultHealthAddress    = ":8081"
 	gracefulShutdownTimeout = 30 * time.Second
+	defaultKubeAPIQPS       = float64(rest.DefaultQPS)
+	defaultKubeAPIBurst     = rest.DefaultBurst
 )
+
+type commandOptions struct {
+	kubeconfig                            string
+	metricsAddress                        string
+	healthAddress                         string
+	leaderElection                        bool
+	kubeAPIQPS                            float64
+	kubeAPIBurst                          int
+	maxConcurrentNamespaceReconciles      int
+	maxConcurrentServiceAccountReconciles int
+}
 
 func main() {
 	handler := slog.NewJSONHandler(os.Stdout, nil)
@@ -38,37 +54,88 @@ func main() {
 	logger := logr.FromSlogHandler(handler)
 	ctrl.SetLogger(logger)
 
-	if err := run(logger); err != nil {
+	options, err := parseCommandOptions(os.Args[1:], os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
+	if err != nil {
+		logger.Error(err, "invalid command-line options")
+		os.Exit(2)
+	}
+
+	if err := run(logger, options); err != nil {
 		logger.Error(err, "controller exited")
 		os.Exit(1)
 	}
 }
 
-func run(logger logr.Logger) error {
-	var (
-		kubeconfig     string
-		metricsAddress string
-		healthAddress  string
-		leaderElection bool
+func parseCommandOptions(args []string, output io.Writer) (commandOptions, error) {
+	options := commandOptions{}
+	flags := flag.NewFlagSet("controller", flag.ContinueOnError)
+	flags.SetOutput(output)
+	flags.StringVar(&options.kubeconfig, "kubeconfig", "", "path to a kubeconfig for local development; in-cluster configuration is used by default")
+	flags.StringVar(&options.metricsAddress, "metrics-bind-address", defaultMetricsAddress, "address for the Prometheus metrics endpoint; set to 0 to disable")
+	flags.StringVar(&options.healthAddress, "health-probe-bind-address", defaultHealthAddress, "address for liveness and readiness probes; set to 0 to disable")
+	flags.BoolVar(&options.leaderElection, "leader-elect", true, "enable leader election for the controller manager")
+	flags.Float64Var(&options.kubeAPIQPS, "kube-api-qps", defaultKubeAPIQPS, "maximum sustained Kubernetes API client requests per second")
+	flags.IntVar(&options.kubeAPIBurst, "kube-api-burst", defaultKubeAPIBurst, "maximum Kubernetes API client burst above the sustained rate")
+	flags.IntVar(
+		&options.maxConcurrentNamespaceReconciles,
+		"max-concurrent-namespace-reconciles",
+		controller.DefaultMaxConcurrentNamespaceReconciles,
+		"maximum concurrent namespace Secret reconciles",
 	)
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "path to a kubeconfig for local development; in-cluster configuration is used by default")
-	flag.StringVar(&metricsAddress, "metrics-bind-address", defaultMetricsAddress, "address for the Prometheus metrics endpoint; set to 0 to disable")
-	flag.StringVar(&healthAddress, "health-probe-bind-address", defaultHealthAddress, "address for liveness and readiness probes; set to 0 to disable")
-	flag.BoolVar(&leaderElection, "leader-elect", true, "enable leader election for the controller manager")
-	flag.Parse()
+	flags.IntVar(
+		&options.maxConcurrentServiceAccountReconciles,
+		"max-concurrent-service-account-reconciles",
+		controller.DefaultMaxConcurrentServiceAccountReconciles,
+		"maximum concurrent ServiceAccount reconciles",
+	)
+	if err := flags.Parse(args); err != nil {
+		return commandOptions{}, err
+	}
+	if flags.NArg() != 0 {
+		return commandOptions{}, fmt.Errorf("unexpected positional arguments: %v", flags.Args())
+	}
+	if options.kubeAPIQPS <= 0 || options.kubeAPIQPS > math.MaxFloat32 || math.IsNaN(options.kubeAPIQPS) || math.IsInf(options.kubeAPIQPS, 0) {
+		return commandOptions{}, fmt.Errorf("kube API QPS must be a finite positive value no greater than %g, got %v", math.MaxFloat32, options.kubeAPIQPS)
+	}
+	if options.kubeAPIBurst < 1 {
+		return commandOptions{}, fmt.Errorf("kube API burst must be at least one, got %d", options.kubeAPIBurst)
+	}
+	if options.maxConcurrentNamespaceReconciles < 1 {
+		return commandOptions{}, fmt.Errorf(
+			"maximum concurrent namespace reconciles must be at least one, got %d",
+			options.maxConcurrentNamespaceReconciles,
+		)
+	}
+	if options.maxConcurrentServiceAccountReconciles < 1 {
+		return commandOptions{}, fmt.Errorf(
+			"maximum concurrent ServiceAccount reconciles must be at least one, got %d",
+			options.maxConcurrentServiceAccountReconciles,
+		)
+	}
+	return options, nil
+}
 
-	restConfig, err := loadRESTConfig(kubeconfig)
+func run(logger logr.Logger, options commandOptions) error {
+	restConfig, err := loadRESTConfig(options.kubeconfig)
 	if err != nil {
 		return fmt.Errorf("load Kubernetes client configuration: %w", err)
 	}
 	restConfig.UserAgent = userAgent
+	restConfig.QPS = float32(options.kubeAPIQPS)
+	restConfig.Burst = options.kubeAPIBurst
 
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		return fmt.Errorf("register Kubernetes scheme: %w", err)
 	}
 
-	controllerOptions := controller.ControllerOptions{}
+	controllerOptions := controller.ControllerOptions{
+		MaxConcurrentNamespaceReconciles:      options.maxConcurrentNamespaceReconciles,
+		MaxConcurrentServiceAccountReconciles: options.maxConcurrentServiceAccountReconciles,
+	}
 	cacheOptions, err := controller.NewCacheOptions(controllerOptions)
 	if err != nil {
 		return fmt.Errorf("configure controller cache: %w", err)
@@ -78,12 +145,12 @@ func run(logger logr.Logger) error {
 		Scheme:                        scheme,
 		Cache:                         cacheOptions,
 		Logger:                        logger,
-		LeaderElection:                leaderElection,
+		LeaderElection:                options.leaderElection,
 		LeaderElectionID:              controller.DefaultLeaderElectionID,
 		LeaderElectionNamespace:       controller.DefaultControllerNamespace,
 		LeaderElectionReleaseOnCancel: true,
-		Metrics:                       metricsserver.Options{BindAddress: metricsAddress},
-		HealthProbeBindAddress:        healthAddress,
+		Metrics:                       metricsserver.Options{BindAddress: options.metricsAddress},
+		HealthProbeBindAddress:        options.healthAddress,
 		GracefulShutdownTimeout:       ptr.To(gracefulShutdownTimeout),
 	})
 	if err != nil {
@@ -152,9 +219,11 @@ func run(logger logr.Logger) error {
 		"config_namespace", controller.DefaultControllerNamespace,
 		"config_name", controller.DefaultConfigMapName,
 		"managed_secret_name", controller.DefaultManagedSecretName,
-		"max_concurrent_namespace_reconciles", controller.DefaultMaxConcurrentNamespaceReconciles,
-		"max_concurrent_service_account_reconciles", controller.DefaultMaxConcurrentServiceAccountReconciles,
-		"leader_election", leaderElection,
+		"kube_api_qps", options.kubeAPIQPS,
+		"kube_api_burst", options.kubeAPIBurst,
+		"max_concurrent_namespace_reconciles", options.maxConcurrentNamespaceReconciles,
+		"max_concurrent_service_account_reconciles", options.maxConcurrentServiceAccountReconciles,
+		"leader_election", options.leaderElection,
 	)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		return fmt.Errorf("run controller manager: %w", err)
