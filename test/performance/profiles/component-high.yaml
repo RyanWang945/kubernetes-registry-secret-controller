@@ -1,0 +1,15 @@
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          args:
+            - --allow-mock-provider
+            - --leader-elect=true
+            - --mock-token-ttl=1h
+            - --credential-refresh-before=10m
+            - --mock-clock-control-address=:8082
+            - --kube-api-qps=25
+            - --kube-api-burst=50
+            - --max-concurrent-namespace-reconciles=8
+            - --max-concurrent-service-account-reconciles=8

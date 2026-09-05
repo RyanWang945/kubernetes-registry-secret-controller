@@ -3,3 +3,7 @@
 /.idea/
 *.test
 coverage.out
+
+# Local performance benchmark artifacts; keep curated Markdown reports.
+/test/performance/results/*
+!/test/performance/results/*.md
