@@ -73,6 +73,9 @@ metadata:
   name: registry-secret-controller-config
   namespace: registry-secret-controller-system
 data:
+  kubeAPIQPS: "25"
+  kubeAPIBurst: "50"
+  workers: "8"
   namespace: registry-secret-e2e-a,registry-secret-e2e-b,registry-secret-e2e-conflict
   serviceaccount: default
   registries: |

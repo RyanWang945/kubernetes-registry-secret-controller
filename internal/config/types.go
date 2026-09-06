@@ -65,10 +65,16 @@ type ConfigurationSnapshot struct {
 	ExcludedNamespaces []string
 	ServiceAccounts    NameSelector
 	Registries         map[RegistryKey]RegistryConfig
+	Runtime            RuntimeConfiguration
 }
 
 // Equal reports semantic equality and intentionally ignores Generation.
 func (s ConfigurationSnapshot) Equal(other ConfigurationSnapshot) bool {
+	return s.Runtime == other.Runtime && s.BusinessEqual(other)
+}
+
+// BusinessEqual excludes process tuning, which must not trigger resource fan-out.
+func (s ConfigurationSnapshot) BusinessEqual(other ConfigurationSnapshot) bool {
 	return reflect.DeepEqual(s.Namespaces, other.Namespaces) &&
 		reflect.DeepEqual(s.ExcludedNamespaces, other.ExcludedNamespaces) &&
 		reflect.DeepEqual(s.ServiceAccounts, other.ServiceAccounts) &&
@@ -82,6 +88,7 @@ func (s ConfigurationSnapshot) MatchesNamespace(name string) bool {
 func (s ConfigurationSnapshot) Clone() ConfigurationSnapshot {
 	clone := ConfigurationSnapshot{
 		Generation:         s.Generation,
+		Runtime:            s.Runtime,
 		Namespaces:         cloneSelector(s.Namespaces),
 		ExcludedNamespaces: append([]string(nil), s.ExcludedNamespaces...),
 		ServiceAccounts:    cloneSelector(s.ServiceAccounts),

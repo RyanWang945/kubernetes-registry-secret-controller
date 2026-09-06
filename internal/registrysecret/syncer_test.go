@@ -3,6 +3,7 @@ package registrysecret
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -137,6 +138,32 @@ func TestSyncerDoesNotOverwriteUnownedSecretOrCreateInMissingNamespace(t *testin
 		}
 	default:
 		t.Fatal("ownership conflict did not produce a Warning Event")
+	}
+	if err := syncer.SyncNamespaceSecret(context.Background(), "production"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-eventRecorder.Events:
+		t.Fatal("unchanged ownership conflict produced a duplicate Event")
+	default:
+	}
+	// A replacement object is a new conflict even at the same namespace/name.
+	if err := baseClient.Delete(context.Background(), current); err != nil {
+		t.Fatal(err)
+	}
+	replacement := unowned.DeepCopy()
+	replacement.ResourceVersion = ""
+	replacement.UID = "replacement"
+	if err := baseClient.Create(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncer.SyncNamespaceSecret(context.Background(), "production"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-eventRecorder.Events:
+	default:
+		t.Fatal("replacement conflict did not produce an Event")
 	}
 
 	if err := syncer.SyncNamespaceSecret(context.Background(), "missing"); err != nil {
@@ -303,6 +330,107 @@ func (c *recordingClient) deleteCount() int {
 type failNamespaceCreateClient struct {
 	client.Client
 	namespace string
+}
+
+func TestCleanupProtectsConcurrentSecretChanges(t *testing.T) {
+	for _, empty := range []bool{false, true} {
+		for _, replacement := range []bool{false, true} {
+			t.Run(fmt.Sprintf("empty=%t/replacement=%t", empty, replacement), func(t *testing.T) {
+				r := testRegistry("cn-test", "cri-a", "key", "secret", "a.example.com")
+				cfg := testSnapshot(r)
+				if !empty {
+					cfg.Namespaces = config.NameSelector{Names: []string{"elsewhere"}}
+				}
+				store := &config.Store{}
+				store.Apply(cfg)
+				content, err := Build(testSnapshot(r), nil, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				old := newSecret(client.ObjectKey{Namespace: "production", Name: "auto-patch-secret"}, content)
+				old.UID = "old-managed"
+				base := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "production"}}, old).Build()
+				wrapper := &deleteRaceClient{Client: base, replacement: replacement}
+				s, err := NewSyncer(wrapper, store, &credential.Store{}, "auto-patch-secret", record.NewFakeRecorder(1))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = s.SyncNamespaceSecret(context.Background(), "production"); !apierrors.IsConflict(err) {
+					t.Fatalf("want delete conflict, got %v", err)
+				}
+				current := getSecret(t, base, "production", "auto-patch-secret")
+				if IsManaged(current) {
+					t.Fatal("concurrent ownership change was lost")
+				}
+				if err = s.SyncNamespaceSecret(context.Background(), "production"); err != nil {
+					t.Fatal(err)
+				}
+				getSecret(t, base, "production", "auto-patch-secret")
+			})
+		}
+	}
+}
+
+type deleteRaceClient struct {
+	client.Client
+	replacement bool
+	raced       bool
+}
+
+func (c *deleteRaceClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if !c.raced {
+		c.raced = true
+		current := &corev1.Secret{}
+		if err := c.Client.Get(ctx, client.ObjectKeyFromObject(obj), current); err != nil {
+			return err
+		}
+		current.Labels = nil
+		if c.replacement {
+			if err := c.Client.Delete(ctx, current); err != nil {
+				return err
+			}
+			current.ResourceVersion = ""
+			current.UID = "new-unowned"
+			if err := c.Client.Create(ctx, current); err != nil {
+				return err
+			}
+		} else if err := c.Client.Update(ctx, current); err != nil {
+			return err
+		}
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
+func TestSyncerWritesHealthyContentDespiteRetentionError(t *testing.T) {
+	a := testRegistry("cn-test", "cri-a", "a", "secret-a", "a.example.com")
+	b := testRegistry("cn-test", "cri-b", "b", "secret-b", "b.example.com")
+	store := &config.Store{}
+	store.Apply(testSnapshot(a, b))
+	credentials := &credential.Store{}
+	credentials.Apply(a, testCredential("user", "new-a", time.Now()))
+	current := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "auto-patch-secret", Namespace: "production", Labels: map[string]string{ApplicationNameLabelKey: ControllerIdentity, ManagedByLabelKey: ControllerIdentity}}, Data: map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{}}`)}}
+	base := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "production"}}, current).Build()
+	s, err := NewSyncer(base, store, credentials, "auto-patch-secret", record.NewFakeRecorder(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SyncNamespaceSecret(context.Background(), "production"); err == nil {
+		t.Fatal("missing state was not reported")
+	}
+	updated := getSecret(t, base, "production", "auto-patch-secret")
+	if decodeDockerConfig(t, updated.Data[corev1.DockerConfigJsonKey]).Auths["a.example.com"].Password != "new-a" {
+		t.Fatal("healthy credential was not written")
+	}
+	// Without any usable content, a retention error must not delete the old object.
+	credentials.Delete(a.Key())
+	updated.Annotations[StateAnnotationKey] = "broken"
+	if err = base.Update(context.Background(), updated); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SyncNamespaceSecret(context.Background(), "production"); err == nil {
+		t.Fatal("broken state was not reported")
+	}
+	getSecret(t, base, "production", "auto-patch-secret")
 }
 
 func (c *failNamespaceCreateClient) Create(ctx context.Context, object client.Object, options ...client.CreateOption) error {

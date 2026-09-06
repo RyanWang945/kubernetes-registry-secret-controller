@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -29,6 +30,9 @@ func (r *NamespaceSecretReconciler) Reconcile(ctx context.Context, request ctrl.
 		return ctrl.Result{}, nil
 	}
 	if err := r.syncer.SyncNamespaceSecret(ctx, request.Name); err != nil {
+		if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, fmt.Errorf("sync Secret in namespace %q: %w", request.Name, err)
 	}
 	return ctrl.Result{}, nil

@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"math"
 	"os"
 	"sync/atomic"
 	"time"
@@ -23,12 +22,17 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/controller"
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/credential"
+	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/kubeclient"
+	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/observability"
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/registrysecret"
 	serviceaccountsyncer "github.com/RyanWang945/kubernetes-registry-secret-controller/internal/serviceaccount"
 )
@@ -44,8 +48,8 @@ const (
 	defaultRetryBaseDelay   = time.Second
 	defaultRetryMaxDelay    = 5 * time.Second
 	gracefulShutdownTimeout = 10 * time.Second
-	defaultKubeAPIQPS       = float64(rest.DefaultQPS)
-	defaultKubeAPIBurst     = rest.DefaultBurst
+	defaultKubeAPIQPS       = config.DefaultKubeAPIQPS
+	defaultKubeAPIBurst     = config.DefaultKubeAPIBurst
 )
 
 type mockTokenProvider struct {
@@ -124,6 +128,7 @@ func main() {
 
 func run(logger logr.Logger) error {
 	var (
+		logLevel                  string
 		kubeconfig                string
 		metricsAddress            string
 		healthAddress             string
@@ -138,6 +143,7 @@ func run(logger logr.Logger) error {
 		namespaceConcurrency      int
 		serviceAccountConcurrency int
 	)
+	flag.StringVar(&logLevel, "log-level", "info", "logging verbosity: debug, info, warn or error")
 	flag.StringVar(&metricsAddress, "metrics-bind-address", defaultMetricsAddress, "address for the Prometheus metrics endpoint")
 	flag.StringVar(&healthAddress, "health-probe-bind-address", defaultHealthAddress, "address for liveness and readiness probes")
 	flag.BoolVar(&leaderElection, "leader-elect", true, "enable leader election")
@@ -146,24 +152,31 @@ func run(logger logr.Logger) error {
 	flag.DurationVar(&refreshBefore, "credential-refresh-before", defaultRefreshBefore, "how long before expiry to refresh the mock credential")
 	flag.Uint64Var(&mockFailures, "mock-initial-failures", 0, "number of initial provider requests to fail in this process")
 	flag.StringVar(&clockControl, "mock-clock-control-address", "", "test-only HTTP address for advancing a fake scheduler clock; empty uses real time")
-	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", defaultKubeAPIQPS, "maximum sustained Kubernetes API client requests per second")
-	flag.IntVar(&kubeAPIBurst, "kube-api-burst", defaultKubeAPIBurst, "maximum Kubernetes API client burst above the sustained rate")
+	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", defaultKubeAPIQPS, "startup/fallback Kubernetes API QPS; ConfigMap overrides the business client live")
+	flag.IntVar(&kubeAPIBurst, "kube-api-burst", defaultKubeAPIBurst, "startup/fallback Kubernetes API burst; ConfigMap overrides the business client live")
 	flag.IntVar(
 		&namespaceConcurrency,
 		"max-concurrent-namespace-reconciles",
 		controller.DefaultMaxConcurrentNamespaceReconciles,
-		"maximum concurrent namespace Secret reconciles",
+		"startup/fallback namespace Secret workers; ConfigMap workers overrides on restart",
 	)
 	flag.IntVar(
 		&serviceAccountConcurrency,
 		"max-concurrent-service-account-reconciles",
 		controller.DefaultMaxConcurrentServiceAccountReconciles,
-		"maximum concurrent ServiceAccount reconciles",
+		"startup/fallback ServiceAccount workers; ConfigMap workers overrides on restart",
 	)
 	flag.Parse()
+	var logErr error
+	logger, logErr = observability.ConfigureLogging(os.Stdout, logLevel)
+	if logErr != nil {
+		return logErr
+	}
+	ctrl.SetLogger(logger)
 	if kubeconfigFlag := flag.Lookup("kubeconfig"); kubeconfigFlag != nil {
 		kubeconfig = kubeconfigFlag.Value.String()
 	}
+	ctx := log.IntoContext(ctrl.SetupSignalHandler(), logger)
 
 	if !allowMock {
 		return errors.New("refusing to start the E2E controller without --allow-mock-provider")
@@ -171,8 +184,8 @@ func run(logger logr.Logger) error {
 	if mockTokenTTL <= refreshBefore {
 		return fmt.Errorf("mock token TTL %s must be greater than refresh-before %s", mockTokenTTL, refreshBefore)
 	}
-	if kubeAPIQPS <= 0 || kubeAPIQPS > math.MaxFloat32 || math.IsNaN(kubeAPIQPS) || math.IsInf(kubeAPIQPS, 0) {
-		return fmt.Errorf("kube API QPS must be a finite positive value no greater than %g, got %v", math.MaxFloat32, kubeAPIQPS)
+	if err := config.ValidateQPS(kubeAPIQPS); err != nil {
+		return err
 	}
 	if kubeAPIBurst < 1 {
 		return fmt.Errorf("kube API burst must be at least one, got %d", kubeAPIBurst)
@@ -196,10 +209,22 @@ func run(logger logr.Logger) error {
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		return fmt.Errorf("register Kubernetes scheme: %w", err)
 	}
+	runtimeSettings, err := kubeclient.Bootstrap(ctx, restConfig, client.ObjectKey{Namespace: controller.DefaultControllerNamespace, Name: controller.DefaultConfigMapName}, kubeclient.Settings{
+		QPS: kubeAPIQPS, Burst: kubeAPIBurst,
+		NamespaceWorkers: namespaceConcurrency, ServiceAccountWorkers: serviceAccountConcurrency,
+	})
+	if err != nil {
+		if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	}
+	initial := runtimeSettings.Current()
 
 	controllerOptions := controller.ControllerOptions{
-		MaxConcurrentNamespaceReconciles:      namespaceConcurrency,
-		MaxConcurrentServiceAccountReconciles: serviceAccountConcurrency,
+		RuntimeUpdater:                        runtimeSettings,
+		MaxConcurrentNamespaceReconciles:      initial.NamespaceWorkers,
+		MaxConcurrentServiceAccountReconciles: initial.ServiceAccountWorkers,
 	}
 	cacheOptions, err := controller.NewCacheOptions(controllerOptions)
 	if err != nil {
@@ -207,6 +232,7 @@ func run(logger logr.Logger) error {
 	}
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		NewClient:                     runtimeSettings.NewClient,
 		Scheme:                        scheme,
 		Cache:                         cacheOptions,
 		Logger:                        logger,
@@ -237,6 +263,15 @@ func run(logger logr.Logger) error {
 	}
 	configStore := &config.Store{}
 	credentialStore := &credential.Store{}
+	obs, err := observability.New(ctrlmetrics.Registry, configStore, credentialStore, observability.Options{
+		Reader: mgr.GetCache(), WaitForCacheSync: mgr.GetCache().WaitForCacheSync, SecretName: controller.DefaultManagedSecretName, Now: schedulerClock.Now,
+	})
+	if err != nil {
+		return fmt.Errorf("create observability: %w", err)
+	}
+	if err = mgr.Add(obs); err != nil {
+		return fmt.Errorf("register observability: %w", err)
+	}
 	resourceEvents, err := controller.NewResourceEventPublisher(mgr.GetClient())
 	if err != nil {
 		return fmt.Errorf("create resource event publisher: %w", err)
@@ -244,7 +279,7 @@ func run(logger logr.Logger) error {
 	credentialScheduler, err := credential.NewScheduler(
 		configStore,
 		credentialStore,
-		newMockTokenProvider(providerID, mockTokenTTL, mockFailures, schedulerClock),
+		obs.WrapProvider(newMockTokenProvider(providerID, mockTokenTTL, mockFailures, schedulerClock)),
 		resourceEvents,
 		schedulerClock,
 		credential.SchedulerOptions{
@@ -306,12 +341,12 @@ func run(logger logr.Logger) error {
 		"refresh_before", refreshBefore,
 		"leader_election", leaderElection,
 		"mock_clock_control_address", clockControl,
-		"kube_api_qps", kubeAPIQPS,
-		"kube_api_burst", kubeAPIBurst,
-		"max_concurrent_namespace_reconciles", namespaceConcurrency,
-		"max_concurrent_service_account_reconciles", serviceAccountConcurrency,
+		"kube_api_qps", initial.QPS,
+		"kube_api_burst", initial.Burst,
+		"max_concurrent_namespace_reconciles", initial.NamespaceWorkers,
+		"max_concurrent_service_account_reconciles", initial.ServiceAccountWorkers,
 	)
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		return fmt.Errorf("run controller manager: %w", err)
 	}
 	return nil

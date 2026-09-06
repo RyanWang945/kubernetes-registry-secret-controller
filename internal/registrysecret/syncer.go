@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -23,6 +25,8 @@ type Syncer struct {
 	credentialStore *credential.Store
 	secretName      string
 	eventRecorder   record.EventRecorder
+	conflictMu      sync.Mutex
+	conflicts       map[string]types.UID
 }
 
 func NewSyncer(
@@ -53,6 +57,7 @@ func NewSyncer(
 		credentialStore: credentialStore,
 		secretName:      secretName,
 		eventRecorder:   eventRecorder,
+		conflicts:       make(map[string]types.UID),
 	}, nil
 }
 
@@ -65,6 +70,7 @@ func (s *Syncer) SyncNamespaceSecret(ctx context.Context, namespace string) erro
 	namespaceObject := &corev1.Namespace{}
 	if err := s.client.Get(ctx, client.ObjectKey{Name: namespace}, namespaceObject); err != nil {
 		if apierrors.IsNotFound(err) {
+			s.clearConflict(namespace)
 			return nil
 		}
 		return fmt.Errorf("get Namespace %q: %w", namespace, err)
@@ -78,18 +84,26 @@ func (s *Syncer) SyncNamespaceSecret(ctx context.Context, namespace string) erro
 	}
 
 	if !snapshot.MatchesNamespace(namespace) {
+		s.clearConflict(namespace)
 		if apierrors.IsNotFound(err) || !IsManaged(current) {
 			return nil
 		}
-		if err := s.client.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
+		if err := s.deleteObserved(ctx, current); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete managed Secret %s: %w", key, err)
 		}
 		return nil
 	}
 
 	if err == nil && !IsManaged(current) {
+		s.conflictMu.Lock()
+		previous, seen := s.conflicts[namespace]
+		s.conflicts[namespace] = current.UID
+		s.conflictMu.Unlock()
+		if seen && previous == current.UID {
+			return nil
+		}
 		conflict := fmt.Errorf("Secret %s exists but is not owned by this controller", key)
-		log.FromContext(ctx).Error(conflict, "cannot manage registry Secret")
+		log.FromContext(ctx).Error(conflict, "cannot manage registry Secret", "namespace", namespace, "name", s.secretName, "operation", "sync_secret", "reason", "OwnershipConflict")
 		s.eventRecorder.Eventf(
 			current,
 			corev1.EventTypeWarning,
@@ -100,6 +114,7 @@ func (s *Syncer) SyncNamespaceSecret(ctx context.Context, namespace string) erro
 		)
 		return nil
 	}
+	s.clearConflict(namespace)
 
 	var existing *corev1.Secret
 	if err == nil {
@@ -107,13 +122,16 @@ func (s *Syncer) SyncNamespaceSecret(ctx context.Context, namespace string) erro
 	}
 	content, buildErr := Build(snapshot, s.credentialStore.Snapshot(), existing)
 	if buildErr != nil {
-		return fmt.Errorf("build managed Secret %s: %w", key, buildErr)
+		buildErr = fmt.Errorf("build managed Secret %s: %w", key, buildErr)
 	}
 	if !content.HasAuth() {
+		if buildErr != nil {
+			return buildErr
+		}
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
-		if err := s.client.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
+		if err := s.deleteObserved(ctx, current); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete empty managed Secret %s: %w", key, err)
 		}
 		return nil
@@ -124,16 +142,35 @@ func (s *Syncer) SyncNamespaceSecret(ctx context.Context, namespace string) erro
 		if err := s.client.Create(ctx, desired); err != nil {
 			return fmt.Errorf("create managed Secret %s: %w", key, err)
 		}
-		return nil
+		log.FromContext(ctx).V(1).Info("created managed Secret", "namespace", namespace, "name", s.secretName, "operation", "create_secret")
+		return buildErr
 	}
 
 	if secretMatches(current, content) {
-		return nil
+		log.FromContext(ctx).V(1).Info("managed Secret is unchanged", "namespace", namespace, "name", s.secretName, "operation", "sync_secret")
+		return buildErr
 	}
 	applyContent(current, content)
 	if err := s.client.Update(ctx, current); err != nil {
 		return fmt.Errorf("update managed Secret %s: %w", key, err)
 	}
+	log.FromContext(ctx).V(1).Info("updated managed Secret", "namespace", namespace, "name", s.secretName, "operation", "update_secret")
+	return buildErr
+}
+
+func (s *Syncer) clearConflict(namespace string) {
+	s.conflictMu.Lock()
+	defer s.conflictMu.Unlock()
+	delete(s.conflicts, namespace)
+}
+
+func (s *Syncer) deleteObserved(ctx context.Context, secret *corev1.Secret) error {
+	if err := s.client.Delete(ctx, secret, client.Preconditions{
+		UID: &secret.UID, ResourceVersion: &secret.ResourceVersion,
+	}); err != nil {
+		return err
+	}
+	log.FromContext(ctx).V(1).Info("deleted managed Secret", "namespace", secret.Namespace, "name", secret.Name, "operation", "delete_secret")
 	return nil
 }
 

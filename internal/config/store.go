@@ -6,11 +6,13 @@ import "sync"
 type Store struct {
 	mu      sync.RWMutex
 	current *ConfigurationSnapshot
+	valid   bool
 }
 
 type ApplyResult struct {
-	Current ConfigurationSnapshot
-	Changed bool
+	Current         ConfigurationSnapshot
+	Changed         bool
+	BusinessChanged bool
 }
 
 // Apply atomically installs a semantically new snapshot. Equivalent updates do
@@ -18,6 +20,7 @@ type ApplyResult struct {
 func (s *Store) Apply(candidate ConfigurationSnapshot) ApplyResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.valid = true
 
 	candidate = candidate.Clone()
 	if s.current != nil && s.current.Equal(candidate) {
@@ -27,7 +30,7 @@ func (s *Store) Apply(candidate ConfigurationSnapshot) ApplyResult {
 		}
 	}
 
-	result := ApplyResult{Changed: true}
+	result := ApplyResult{Changed: true, BusinessChanged: s.current == nil || !s.current.BusinessEqual(candidate)}
 	if s.current != nil {
 		candidate.Generation = s.current.Generation + 1
 	} else {
@@ -37,6 +40,20 @@ func (s *Store) Apply(candidate ConfigurationSnapshot) ApplyResult {
 	s.current = &candidate
 	result.Current = candidate.Clone()
 	return result
+}
+
+// MarkInvalid preserves the last valid snapshot while exposing the state of
+// the latest observed ConfigMap independently from process readiness.
+func (s *Store) MarkInvalid() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.valid = false
+}
+
+func (s *Store) Valid() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.valid
 }
 
 func (s *Store) Load() (ConfigurationSnapshot, bool) {

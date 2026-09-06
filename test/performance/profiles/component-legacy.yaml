@@ -1,0 +1,16 @@
+# Historical 5/10/2/2 profile retained for reproducing earlier comparisons.
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          args:
+            - --allow-mock-provider
+            - --leader-elect=true
+            - --mock-token-ttl=1h
+            - --credential-refresh-before=10m
+            - --mock-clock-control-address=:8082
+            - --kube-api-qps=5
+            - --kube-api-burst=10
+            - --max-concurrent-namespace-reconciles=2
+            - --max-concurrent-service-account-reconciles=2

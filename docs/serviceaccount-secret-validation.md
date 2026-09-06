@@ -46,18 +46,18 @@ Namespace 的固定名称 Secret，并检查：
   `imagePullSecrets`；
 - Secret 满足最小校验：确保固定引用恰好存在一次；
 - Secret 不存在、正在删除或结构不完整：不新增引用，也不移除已经存在的固定引用，
-  返回可重试的 `ManagedSecretNotReady` 错误，由 Controller 限速队列重新调谐；
+  Syncer 返回 `ManagedSecretNotReady`，Controller 转换为 `RequeueAfter: 10s` 非错误重排；
 - 同名 Secret 存在但不受管：不新增引用；已有固定引用时将其移除。所有权冲突由
   Namespace Secret Controller 记录 Error 日志并产生 Kubernetes Warning Event，
   不按 ServiceAccount 重复告警。
 
 Secret Create 事件用于立即唤醒同 Namespace 中等待首次注入的目标 ServiceAccount；
-限速重试作为事件延迟或丢失时的兜底。Secret Update 只在受管身份发生变化时扇出
+延迟重排作为事件延迟或丢失时的兜底。Secret Update 只在受管身份发生变化时扇出
 ServiceAccount，正常 Token 轮换和内容修复不触发 SA 全量调谐。Secret Delete 由
 Namespace Secret Controller 负责重建，不主动摘除已有 SA 引用。
 
-`NotFound`、删除中和结构暂不完整属于可恢复状态，可以通过受限速的 Reconcile 错误、
-日志和 Metrics 观察，但不为每个 ServiceAccount 反复产生 Warning Event。Secret 创建
+`NotFound`、删除中和结构暂不完整属于正常依赖等待，通过 Debug 日志和业务 Metrics
+观察，不计入 Reconcile 错误，也不反复产生 Warning Event。Secret 创建
 或更新失败的告警统一归属 Namespace Secret Controller。
 
 ## 一致性边界
@@ -72,7 +72,7 @@ Cache 可能短暂返回旧对象，本方案只保证最终收敛。保留稳�
 ## 测试
 
 - Secret 不存在、正在删除、Type 错误或 `.dockerconfigjson` 为空时，不新增固定引用并
-  返回可重试错误；
+  返回依赖等待，由 Controller 非错误延迟重排；
 - 上述暂时不可用场景不会移除 ServiceAccount 已有的固定引用；
 - 受管且结构完整的 Secret 允许注入，并对重复引用去重；
 - 同名非受管 Secret 阻止注入并清理固定引用，同时保留用户的其他引用；

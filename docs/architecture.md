@@ -19,8 +19,8 @@ Secret 及其 Watch 事件协作。
 2. Syncer 读取最新配置，并通过 Manager Cache 读取同 Namespace 的固定名称 Secret。
 3. Secret 存在、未删除、受管且结构完整时，使用 optimistic-lock Patch 确保固定引用
    恰好存在一次。
-4. Secret 不存在、正在删除或结构不完整时，不新增也不移除固定引用，返回可重试错误；
-   Secret Create 事件会立即唤醒等待对象，限速队列负责兜底。
+4. Secret 不存在、正在删除或结构不完整时，不新增也不移除固定引用，Controller 以
+   10 秒非错误重排兜底；Secret Create 事件会立即唤醒等待对象。
 5. 同名 Secret 不受管时不新增引用，并清理可能遗留的固定引用；所有权冲突由
    Namespace Secret Controller 集中告警。
 
@@ -29,14 +29,17 @@ Patch 前读取走 Manager Cache，不会为每个 ServiceAccount 调用 ACR。�
 
 ## 用户修改 ConfigMap
 
-1. Configuration Controller 从 Cache 读取固定 ConfigMap。无效配置只记录错误并保留
-   最后一份有效快照。
+1. Configuration Controller 从 Cache 读取固定 ConfigMap。无效配置记录脱敏错误和
+   Warning Event，更新 config_valid 指标，并保留最后一份有效快照。
 2. 有效配置原子写入 Config Store，并通知 Credential Scheduler 和 Resource Event
    Publisher。
 3. Namespace Secret Controller、ServiceAccount Controller 和凭证调度并行收敛：前者
    渲染固定 Secret，后者重新匹配 SA，Scheduler 只为新增 Registry 或 AK/SK 变化立即
    取证。
 4. Secret 始终使用固定名称；配置收敛期间，暂时不可用不会导致已有 SA 引用抖动。
+
+仅修改运行参数时不触发全量分发：QPS/Burst 热更新业务客户端，Worker 变更提示
+重启。默认值与生效范围见 [运行参数配置](./runtime-configuration.md)。
 
 Domain 或 Namespace/ServiceAccount 选择变化可以复用现有 Token；Registry 新增或
 AK/SK 变化才需要立即重新调用 ACR。
@@ -52,6 +55,6 @@ AK/SK 变化才需要立即重新调用 ACR。
 4. ACR 失败时按 5～60 秒退避重试并继续保留旧 Secret 和 SA 引用；旧 Token 最终过期
    也不会触发引用摘除。
 
-当前已经实现提前五分钟刷新、调用超时和失败退避；“刷新持续失败直至旧 Token
-过期”后的业务级 Event 和 Metrics 仍属于待实现范围，但不需要改变 ServiceAccount
-引用。
+当前已实现提前五分钟刷新、调用超时和失败退避。业务指标分别观察内存凭据和
+已分发副本，旧副本过期由 Prometheus 规则告警，不改变 ServiceAccount 引用。
+指标与日志实现见 [日志与指标设计](./observability.md)。

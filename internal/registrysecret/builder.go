@@ -63,6 +63,8 @@ func (c Content) HasAuth() bool {
 // Build creates deterministic Docker auth and state documents from one atomic
 // configuration snapshot and one credential snapshot. Existing is consulted
 // only to retain credentials for configured RegistryKeys that are pending.
+// A retention error may accompany usable Content: callers must still distribute
+// that content, but must not delete an existing Secret when the result is empty.
 func Build(
 	snapshot config.ConfigurationSnapshot,
 	credentials map[config.RegistryKey]credential.Entry,
@@ -84,15 +86,16 @@ func Build(
 		addCredential(&dockerConfig, &state, registry, entry.Credential)
 	}
 
+	var retentionErrors []error
 	if len(pending) > 0 && existing != nil {
 		existingDocker, existingState, present, err := parseExisting(existing)
 		if err != nil {
-			return Content{}, err
+			retentionErrors = append(retentionErrors, err)
 		}
 		if present {
 			for _, registry := range pending {
 				if err := retainPending(&dockerConfig, &state, registry, existingDocker, existingState); err != nil {
-					return Content{}, err
+					retentionErrors = append(retentionErrors, err)
 				}
 			}
 		}
@@ -110,7 +113,7 @@ func Build(
 		DockerJSON: dockerJSON,
 		StateJSON:  string(stateJSON),
 		hasAuth:    len(dockerConfig.Auths) > 0,
-	}, nil
+	}, errors.Join(retentionErrors...)
 }
 
 func addCredential(
@@ -140,29 +143,44 @@ func parseExisting(secret *corev1.Secret) (DockerConfig, PersistedState, bool, e
 	if !hasDocker && !hasState {
 		return DockerConfig{}, PersistedState{}, false, nil
 	}
-	if !hasDocker || !hasState {
-		return DockerConfig{}, PersistedState{}, false, errors.New("existing managed Secret has incomplete Docker config or registry state")
+	// Decode records independently: a malformed entry must not hide intact
+	// credentials belonging to other registries. Never return decoder errors,
+	// which can embed sensitive values (for example an invalid timestamp).
+	var problems []error
+	dockerConfig := DockerConfig{Auths: make(map[string]DockerAuth)}
+	var rawDocker struct {
+		Auths map[string]json.RawMessage `json:"auths"`
 	}
-
-	var dockerConfig DockerConfig
-	if err := json.Unmarshal(dockerJSON, &dockerConfig); err != nil {
-		return DockerConfig{}, PersistedState{}, false, fmt.Errorf("parse existing Docker config: %w", err)
+	if err := json.Unmarshal(dockerJSON, &rawDocker); err != nil || rawDocker.Auths == nil {
+		problems = append(problems, errors.New("existing Docker config is invalid or missing"))
+	} else {
+		for domain, raw := range rawDocker.Auths {
+			var auth DockerAuth
+			if err := json.Unmarshal(raw, &auth); err != nil {
+				problems = append(problems, errors.New("existing Docker config contains an invalid auth entry"))
+				continue
+			}
+			dockerConfig.Auths[domain] = auth
+		}
 	}
-	if dockerConfig.Auths == nil {
-		return DockerConfig{}, PersistedState{}, false, errors.New("existing Docker config has no auths object")
+	state := PersistedState{Version: StateVersion, Registries: make(map[string]RegistryState)}
+	var rawState struct {
+		Version    int                        `json:"version"`
+		Registries map[string]json.RawMessage `json:"registries"`
 	}
-
-	var state PersistedState
-	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
-		return DockerConfig{}, PersistedState{}, false, fmt.Errorf("parse existing registry state: %w", err)
+	if err := json.Unmarshal([]byte(stateJSON), &rawState); err != nil || rawState.Version != StateVersion || rawState.Registries == nil {
+		problems = append(problems, errors.New("existing registry state is invalid, unsupported or missing"))
+	} else {
+		for key, raw := range rawState.Registries {
+			var value RegistryState
+			if err := json.Unmarshal(raw, &value); err != nil {
+				problems = append(problems, errors.New("existing registry state contains an invalid entry"))
+				continue
+			}
+			state.Registries[key] = value
+		}
 	}
-	if state.Version != StateVersion {
-		return DockerConfig{}, PersistedState{}, false, fmt.Errorf("existing registry state version %d is unsupported", state.Version)
-	}
-	if state.Registries == nil {
-		return DockerConfig{}, PersistedState{}, false, errors.New("existing registry state has no registries object")
-	}
-	return dockerConfig, state, true, nil
+	return dockerConfig, state, true, errors.Join(problems...)
 }
 
 func retainPending(
@@ -189,22 +207,30 @@ func retainPending(
 	if !hasState {
 		return fmt.Errorf("pending registry %s has Docker auth without registry state", registry.Key())
 	}
-	if registryState.RefreshedAt.IsZero() || registryState.ExpiresAt.IsZero() || registryState.StateHash == "" {
+	if registryState.RefreshedAt.IsZero() || !registryState.ExpiresAt.After(registryState.RefreshedAt) || registryState.StateHash == "" {
 		return fmt.Errorf("pending registry %s has incomplete registry state", registry.Key())
 	}
 
+	var problems []error
+	retained := false
 	for _, domain := range registry.Domains {
 		auth, found := existingDocker.Auths[domain]
 		if !found {
-			return fmt.Errorf("pending registry %s is missing existing auth for domain %q", registry.Key(), domain)
+			// A newly added domain has no old credential to retain. Wait for
+			// acquisition without blocking other domains or other registries.
+			continue
 		}
 		if auth.Username == "" || auth.Password == "" || auth.Auth != encodedAuth(auth.Username, auth.Password) {
-			return fmt.Errorf("pending registry %s has invalid existing auth for domain %q", registry.Key(), domain)
+			problems = append(problems, fmt.Errorf("pending registry %s has invalid existing auth for domain %q", registry.Key(), domain))
+			continue
 		}
 		dockerConfig.Auths[domain] = auth
+		retained = true
 	}
-	state.Registries[registry.Key().String()] = registryState
-	return nil
+	if retained {
+		state.Registries[registry.Key().String()] = registryState
+	}
+	return errors.Join(problems...)
 }
 
 func stateHash(registry config.RegistryConfig, value credential.Credential) string {

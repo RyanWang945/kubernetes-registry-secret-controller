@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry-secret-controller-metrics
+  namespace: registry-secret-controller-system
+  labels:
+    app.kubernetes.io/name: kubernetes-registry-secret-controller
+    observability-job: registry-secret-controller
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kubernetes-registry-secret-controller
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080

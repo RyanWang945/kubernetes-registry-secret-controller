@@ -1,0 +1,142 @@
+rule_files: [rules.yaml]
+evaluation_interval: 30s
+tests:
+  - name: follower and old leader never trigger business alerts
+    interval: 30s
+    input_series:
+      - series: 'up{job="registry-secret-controller",instance="old"}'
+        values: '1x20'
+      - series: 'up{job="registry-secret-controller",instance="new"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_active{job="registry-secret-controller",instance="old"}'
+        values: '0x20'
+      - series: 'registry_secret_controller_active{job="registry-secret-controller",instance="new"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_observation_success{job="registry-secret-controller",instance="old"}'
+        values: '0x20'
+      - series: 'registry_secret_controller_observation_success{job="registry-secret-controller",instance="new"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_secret_targets{job="registry-secret-controller",instance="old",registry="cn-test/cri-a",state="expired"}'
+        values: '10x20'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertstate="firing",alertname=~"RegistrySecretCredentialExpired|RegistrySecretObservationFailed|RegistrySecretControllerNoLeader"}) or vector(0)'
+        eval_time: 6m
+        exp_samples: [{labels: '{}', value: 0}]
+      - expr: registry_secret_controller:active
+        eval_time: 6m
+        exp_samples:
+          - labels: 'registry_secret_controller:active{job="registry-secret-controller",instance="new"}'
+            value: 1
+  - name: successful acquisition does not hide expired copies
+    interval: 30s
+    input_series:
+      - series: 'up{job="registry-secret-controller",instance="leader"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_active{job="registry-secret-controller",instance="leader"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_observation_success{job="registry-secret-controller",instance="leader"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_credential_expiration_timestamp_seconds{job="registry-secret-controller",instance="leader",registry="cn-test/cri-a"}'
+        values: '3600x20'
+      - series: 'registry_secret_controller_secret_targets{job="registry-secret-controller",instance="leader",registry="cn-test/cri-a",state="expired"}'
+        values: '2x20'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertstate="firing",alertname="RegistrySecretCredentialExpired"}) or vector(0)'
+        eval_time: 30s
+        exp_samples: [{labels: '{}', value: 0}]
+      - expr: 'count(ALERTS{alertstate="firing",alertname="RegistrySecretCredentialExpired"})'
+        eval_time: 2m
+        exp_samples: [{labels: '{}', value: 1}]
+  - name: failed scrape suppresses stale leader state
+    interval: 30s
+    input_series:
+      - series: 'up{job="registry-secret-controller",instance="old"}'
+        values: '0x20'
+      - series: 'registry_secret_controller_active{job="registry-secret-controller",instance="old"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_observation_success{job="registry-secret-controller",instance="old"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_secret_targets{job="registry-secret-controller",instance="old",registry="cn-test/cri-a",state="expired"}'
+        values: '5x20'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertstate="firing",alertname="RegistrySecretControllerUnavailable"})'
+        eval_time: 2m
+        exp_samples: [{labels: '{}', value: 1}]
+      - expr: 'count(ALERTS{alertstate="firing",alertname=~"RegistrySecretCredentialExpired|RegistrySecretControllerNoLeader"}) or vector(0)'
+        eval_time: 2m
+        exp_samples: [{labels: '{}', value: 0}]
+  - name: missing targets still alert without an expiration series
+    interval: 30s
+    input_series:
+      - series: 'up{job="registry-secret-controller",instance="leader"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_active{job="registry-secret-controller",instance="leader"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_observation_success{job="registry-secret-controller",instance="leader"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_secret_targets{job="registry-secret-controller",instance="leader",registry="cn-test/cri-a",state="pending"}'
+        values: '5x20'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertstate="firing",alertname="RegistrySecretTargetsNotConverged"})'
+        eval_time: 6m
+        exp_samples: [{labels: '{}', value: 1}]
+  - name: observation failure is unknown rather than healthy
+    interval: 30s
+    input_series:
+      - series: 'up{job="registry-secret-controller",instance="leader"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_active{job="registry-secret-controller",instance="leader"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_observation_success{job="registry-secret-controller",instance="leader"}'
+        values: '0x20'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertstate="firing",alertname="RegistrySecretObservationFailed"})'
+        eval_time: 2m
+        exp_samples: [{labels: '{}', value: 1}]
+  - name: a reachable follower cannot replace a leader
+    interval: 30s
+    input_series:
+      - series: 'up{job="registry-secret-controller",instance="follower"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_active{job="registry-secret-controller",instance="follower"}'
+        values: '0x20'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertstate="firing",alertname="RegistrySecretControllerNoLeader"})'
+        eval_time: 2m
+        exp_samples: [{labels: '{}', value: 1}]
+  - name: discovery missing entirely
+    interval: 30s
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertstate="firing",alertname="RegistrySecretControllerUnavailable"})'
+        eval_time: 2m
+        exp_samples: [{labels: '{}', value: 1}]
+  - name: valid memory does not hide an expiring pending copy
+    interval: 30s
+    input_series:
+      - series: 'up{job="registry-secret-controller",instance="leader"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_active{job="registry-secret-controller",instance="leader"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_observation_success{job="registry-secret-controller",instance="leader"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_oldest_secret_expiration_timestamp_seconds{job="registry-secret-controller",instance="leader",registry="cn-test/cri-a"}'
+        values: '100x20'
+      - series: 'registry_secret_controller_credential_expiration_timestamp_seconds{job="registry-secret-controller",instance="leader",registry="cn-test/cri-a"}'
+        values: '3600x20'
+      - series: 'registry_secret_controller_secret_targets{job="registry-secret-controller",instance="leader",registry="cn-test/cri-a",state="pending"}'
+        values: '1x20'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertstate="firing",alertname="RegistrySecretCredentialExpiring"})'
+        eval_time: 1m
+        exp_samples: [{labels: '{}', value: 1}]
+  - name: invalid configuration on a reachable replica
+    interval: 30s
+    input_series:
+      - series: 'up{job="registry-secret-controller",instance="follower"}'
+        values: '1x20'
+      - series: 'registry_secret_controller_config_valid{job="registry-secret-controller",instance="follower"}'
+        values: '0x20'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertstate="firing",alertname="RegistrySecretConfigurationInvalid"})'
+        eval_time: 2m
+        exp_samples: [{labels: '{}', value: 1}]

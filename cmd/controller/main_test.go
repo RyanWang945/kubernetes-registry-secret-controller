@@ -16,13 +16,14 @@ func TestParseCommandOptionsDefaults(t *testing.T) {
 	}
 
 	want := commandOptions{
+		logLevel:                              "info",
 		metricsAddress:                        defaultMetricsAddress,
 		healthAddress:                         defaultHealthAddress,
 		leaderElection:                        true,
-		kubeAPIQPS:                            defaultKubeAPIQPS,
-		kubeAPIBurst:                          defaultKubeAPIBurst,
-		maxConcurrentNamespaceReconciles:      2,
-		maxConcurrentServiceAccountReconciles: 2,
+		kubeAPIQPS:                            25,
+		kubeAPIBurst:                          50,
+		maxConcurrentNamespaceReconciles:      8,
+		maxConcurrentServiceAccountReconciles: 8,
 	}
 	if options != want {
 		t.Fatalf("options = %#v, want %#v", options, want)
@@ -33,6 +34,9 @@ func TestParseCommandOptionsExplicitValues(t *testing.T) {
 	options, err := parseCommandOptions([]string{
 		"--kubeconfig=/tmp/controller.kubeconfig",
 		"--metrics-bind-address=127.0.0.1:9090",
+		"--metrics-secure=true",
+		"--metrics-cert-dir=/etc/metrics-tls",
+		"--log-level=debug",
 		"--health-probe-bind-address=0",
 		"--leader-elect=false",
 		"--kube-api-qps=25.5",
@@ -45,6 +49,9 @@ func TestParseCommandOptionsExplicitValues(t *testing.T) {
 	}
 
 	want := commandOptions{
+		logLevel:                              "debug",
+		metricsSecure:                         true,
+		metricsCertDir:                        "/etc/metrics-tls",
 		kubeconfig:                            "/tmp/controller.kubeconfig",
 		metricsAddress:                        "127.0.0.1:9090",
 		healthAddress:                         "0",
@@ -94,6 +101,11 @@ func TestParseCommandOptionsRejectsInvalidArguments(t *testing.T) {
 		args []string
 		want string
 	}{
+		{
+			name: "invalid log level",
+			args: []string{"--log-level=verbose"},
+			want: "log level must",
+		},
 		{
 			name: "unknown flag",
 			args: []string{"--not-a-controller-flag"},

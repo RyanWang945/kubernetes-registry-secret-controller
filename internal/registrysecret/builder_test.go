@@ -2,6 +2,7 @@ package registrysecret
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,6 +183,74 @@ func TestBuildDoesNotRehashOldCredentialAfterAccessKeyRotation(t *testing.T) {
 	}
 	if rotated.StateJSON != initial.StateJSON || string(rotated.DockerJSON) != string(initial.DockerJSON) {
 		t.Fatal("old credential was rehashed as if it came from the rotated AK/SK")
+	}
+}
+
+func TestBuildIsolatesPendingRotationAndDomainChanges(t *testing.T) {
+	a := testRegistry("cn-test", "cri-a", "a", "secret-a", "a.example.com")
+	b := testRegistry("cn-test", "cri-b", "b", "secret-b", "b.example.com", "removed.example.com")
+	now := time.Now()
+	initial, err := Build(testSnapshot(a, b), map[config.RegistryKey]credential.Entry{
+		a.Key(): testEntry(a, testCredential("a", "old-a", now)),
+		b.Key(): testEntry(b, testCredential("b", "old-b", now)),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.AccessKeySecret = "rotated-secret"
+	b.Domains = []string{"b.example.com", "new.example.com"}
+	updated, err := Build(testSnapshot(a, b), map[config.RegistryKey]credential.Entry{
+		a.Key(): testEntry(a, testCredential("a", "new-a", now.Add(time.Minute))),
+	}, secretFromContent("production", initial))
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := decodeDockerConfig(t, updated.DockerJSON).Auths
+	if auths["a.example.com"].Password != "new-a" || auths["b.example.com"].Password != "old-b" || len(auths) != 2 {
+		t.Fatal("healthy credential, retained domain, or removed/new domain handling is incorrect")
+	}
+	if decodeState(t, updated.StateJSON).Registries[b.Key().String()] != decodeState(t, initial.StateJSON).Registries[b.Key().String()] {
+		t.Fatal("pending state was rehashed under the new authentication configuration")
+	}
+}
+
+func TestBuildRetainsIntactRegistriesWhenAnotherStateIsMalformed(t *testing.T) {
+	a := testRegistry("cn-test", "cri-a", "a", "secret-a", "a.example.com")
+	b := testRegistry("cn-test", "cri-b", "b", "secret-b", "b.example.com")
+	c := testRegistry("cn-test", "cri-c", "c", "secret-c", "c.example.com")
+	entries := make(map[config.RegistryKey]credential.Entry)
+	for _, r := range []config.RegistryConfig{a, b, c} {
+		entries[r.Key()] = testEntry(r, testCredential("user", "old", time.Now()))
+	}
+	initial, err := Build(testSnapshot(a, b, c), entries, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := secretFromContent("production", initial)
+	var state map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(initial.StateJSON), &state); err != nil {
+		t.Fatal(err)
+	}
+	var registries map[string]json.RawMessage
+	if err := json.Unmarshal(state["registries"], &registries); err != nil {
+		t.Fatal(err)
+	}
+	registries[b.Key().String()] = json.RawMessage(`{"refreshedAt":"secret-value-must-not-be-logged"}`)
+	state["registries"], _ = json.Marshal(registries)
+	raw, _ := json.Marshal(state)
+	existing.Annotations[StateAnnotationKey] = string(raw)
+	updated, err := Build(testSnapshot(a, b, c), map[config.RegistryKey]credential.Entry{
+		a.Key(): testEntry(a, testCredential("user", "new", time.Now())),
+	}, existing)
+	if err == nil {
+		t.Fatal("malformed state was not reported")
+	}
+	if strings.Contains(err.Error(), "secret-value") {
+		t.Fatal("decoder error leaked a sensitive value")
+	}
+	auths := decodeDockerConfig(t, updated.DockerJSON).Auths
+	if auths["a.example.com"].Password != "new" || auths["c.example.com"].Password != "old" {
+		t.Fatal("unrelated credentials failed to converge")
 	}
 }
 

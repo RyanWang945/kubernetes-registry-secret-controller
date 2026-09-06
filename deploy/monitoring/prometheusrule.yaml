@@ -1,0 +1,94 @@
+# Generated from rules.yaml; keep spec identical to the standalone rules.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: registry-secret-controller
+  namespace: registry-secret-controller-system
+  labels:
+    app.kubernetes.io/name: kubernetes-registry-secret-controller
+spec:
+  # Tune the 120-second expiry margin and 5-minute convergence budget to the
+  # deployed namespace count, API throughput and acquisition retry budget.
+  groups:
+    - name: registry-secret-controller
+      interval: 30s
+      rules:
+        - record: registry_secret_controller:active
+          expr: |
+            (registry_secret_controller_active{job="registry-secret-controller"} == 1)
+            and on (job, instance) (up{job="registry-secret-controller"} == 1)
+        - alert: RegistrySecretControllerUnavailable
+          expr: |
+            (sum(up{job="registry-secret-controller"}) == 0)
+            or absent(up{job="registry-secret-controller"})
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: Registry Secret Controller metrics are unavailable
+            description: Check controller Pods, the metrics Service, scrape discovery and access policy.
+        - alert: RegistrySecretControllerNoLeader
+          expr: |
+            ((sum(registry_secret_controller:active) or vector(0)) == 0)
+            and on () (max(up{job="registry-secret-controller"}) == 1)
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: Registry Secret Controller has no active instance
+            description: Inspect Lease permissions, leadership logs and Manager startup. This also checks deployments with election disabled.
+        - alert: RegistrySecretCredentialExpired
+          expr: |
+            (registry_secret_controller_secret_targets{job="registry-secret-controller",state="expired"} > 0)
+            and on (job, instance) registry_secret_controller:active
+            and on (job, instance) (registry_secret_controller_observation_success == 1)
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: Target registry credentials have expired
+            description: Inspect ACR acquisition and Secret reconciliation for registry {{ $labels.registry }}; existing Pods may fail image pulls.
+        - alert: RegistrySecretCredentialExpiring
+          expr: |
+            (registry_secret_controller_oldest_secret_expiration_timestamp_seconds{job="registry-secret-controller"} - time() < 120)
+            and (registry_secret_controller_oldest_secret_expiration_timestamp_seconds{job="registry-secret-controller"} > time())
+            and on (job, instance, registry) (sum without (state) (registry_secret_controller_secret_targets{job="registry-secret-controller",state!="synced"}) > 0)
+            and on (job, instance) registry_secret_controller:active
+            and on (job, instance) (registry_secret_controller_observation_success == 1)
+          for: 30s
+          labels:
+            severity: warning
+          annotations:
+            summary: Registry credential distribution is approaching expiry
+            description: Check pending Secret writes and API throughput for registry {{ $labels.registry }} before the oldest copy expires.
+        - alert: RegistrySecretTargetsNotConverged
+          expr: |
+            (sum without (state) (registry_secret_controller_secret_targets{job="registry-secret-controller",state=~"pending|conflict|invalid"}) > 0)
+            and on (job, instance) registry_secret_controller:active
+            and on (job, instance) (registry_secret_controller_observation_success == 1)
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Registry Secret targets have not converged
+            description: Inspect logs and Warning Events for missing, conflicting or invalid copies of registry {{ $labels.registry }}.
+        - alert: RegistrySecretConfigurationInvalid
+          expr: |
+            min(registry_secret_controller_config_valid{job="registry-secret-controller"}
+            and on (job, instance) (up{job="registry-secret-controller"} == 1)) == 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: Registry Secret Controller configuration is invalid or missing
+            description: Inspect the fixed ConfigMap and InvalidConfiguration Events. Existing processes retain their last valid configuration.
+        - alert: RegistrySecretObservationFailed
+          expr: |
+            (registry_secret_controller_observation_success{job="registry-secret-controller"} == 0)
+            and on (job, instance) registry_secret_controller:active
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: Registry Secret Controller cannot observe target state
+            description: Check configuration loading, informer synchronization and Namespace/Secret read permissions; missing state is not evidence of health.

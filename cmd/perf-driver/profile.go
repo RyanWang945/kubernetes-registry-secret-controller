@@ -10,8 +10,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 
+	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/controller"
 )
 
@@ -64,8 +64,8 @@ func profileFromDeployment(deployment *appsv1.Deployment, observedAt time.Time) 
 	if err != nil {
 		return controllerProfile{}, err
 	}
-	qps := argumentValue(args, "kube-api-qps", strconv.FormatFloat(float64(rest.DefaultQPS), 'f', -1, 32))
-	burst := argumentValue(args, "kube-api-burst", strconv.Itoa(rest.DefaultBurst))
+	qps := argumentValue(args, "kube-api-qps", strconv.FormatFloat(config.DefaultKubeAPIQPS, 'f', -1, 64))
+	burst := argumentValue(args, "kube-api-burst", strconv.Itoa(config.DefaultKubeAPIBurst))
 
 	return controllerProfile{
 		Replicas:                           1,

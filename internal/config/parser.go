@@ -14,7 +14,7 @@ import (
 func Parse(data map[string]string) (ConfigurationSnapshot, error) {
 	for key := range data {
 		switch key {
-		case NamespaceKey, ExcludeNamespaceKey, ServiceAccountKey, RegistriesKey:
+		case NamespaceKey, ExcludeNamespaceKey, ServiceAccountKey, RegistriesKey, KubeAPIQPSKey, KubeAPIBurstKey, WorkersKey:
 		default:
 			return ConfigurationSnapshot{}, fmt.Errorf("unsupported ConfigMap data key %q", key)
 		}
@@ -51,12 +51,17 @@ func Parse(data map[string]string) (ConfigurationSnapshot, error) {
 	if err != nil {
 		return ConfigurationSnapshot{}, err
 	}
+	runtime, err := parseRuntime(data)
+	if err != nil {
+		return ConfigurationSnapshot{}, err
+	}
 
 	return ConfigurationSnapshot{
 		Namespaces:         namespaces,
 		ExcludedNamespaces: excludedNamespaces,
 		ServiceAccounts:    serviceAccounts,
 		Registries:         registries,
+		Runtime:            runtime,
 	}, nil
 }
 

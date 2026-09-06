@@ -11,8 +11,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
-// ConfigurationObserver is notified after a valid configuration has been
-// installed. Implementations must return quickly; the configuration
+// ConfigurationObserver is notified after a valid business configuration has
+// changed (including initial load). Implementations must return quickly; the configuration
 // controller must not wait for downstream work to finish.
 type ConfigurationObserver interface {
 	NotifyConfigurationChanged()

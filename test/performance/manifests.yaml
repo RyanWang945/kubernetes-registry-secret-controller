@@ -141,10 +141,10 @@ spec:
             - --mock-token-ttl=1h
             - --credential-refresh-before=10m
             - --mock-clock-control-address=:8082
-            - --kube-api-qps=5
-            - --kube-api-burst=10
-            - --max-concurrent-namespace-reconciles=2
-            - --max-concurrent-service-account-reconciles=2
+            - --kube-api-qps=25
+            - --kube-api-burst=50
+            - --max-concurrent-namespace-reconciles=8
+            - --max-concurrent-service-account-reconciles=8
           ports:
             - name: metrics
               containerPort: 8080

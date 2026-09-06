@@ -12,7 +12,7 @@
 - [x] 使用 controller-runtime Manager 统一管理 Cache、Controller、选主、探针和优雅退出。
 - [x] 将 Cache 限定为固定 ConfigMap、Namespace、ServiceAccount 和固定名称输出 Secret。
 - [x] 让 Configuration Controller 在全部副本运行，并在有效配置后全量触发 Namespace 级 Reconcile。
-- [x] 建立仅在 Leader 执行的 Namespace 级调谐骨架，接入标准限速队列、两个并发 Reconcile 和 Follower Cache warmup。
+- [x] 建立仅在 Leader 执行的 Namespace 级调谐骨架，接入标准限速队列、有界并发 Reconcile 和 Follower Cache warmup。
 - [x] 提供可替换的 Namespace Syncer 接口。
 - [x] 编写配置解析、规范化、配置存储和事件映射单元测试。
 - [x] 编写 Manager envtest 集成测试，验证初始 List、持续 Watch、标准重试和优雅退出。
@@ -62,12 +62,32 @@
 
 - [x] Secret Builder 尚未取得任何凭据时不创建空 Secret。
 - [x] ServiceAccount 新增固定引用前校验 Secret 存在、未在删除、明确受管、Type 正确且 `.dockerconfigjson` 非空。
-- [x] Secret 暂时不可用时不新增引用、不移除已有引用，并交由 Controller 限速重试。
+- [x] Secret 暂时不可用时不新增引用、不移除已有引用，并交由 Controller 非错误延迟重排。
 - [x] Secret Create 和受管身份变化唤醒相关 ServiceAccount；普通 Token/Data Update 不扇出。
 - [x] 所有权冲突由 Namespace Secret Controller 集中记录 Error 日志和 Warning Event。
 - [x] 补充单元测试和 envtest，覆盖暂时不可用、稳定引用、事件唤醒及正常轮换不 Patch SA。
 
-## 下一里程碑：恢复、高可用与可观测性
+## Review 修复与可观测性
+
+- [x] Secret 删除携带 UID/resourceVersion 前置条件，覆盖对象替换与所有权变化竞态。
+- [x] 隔离 Pending Registry 的域名变化和损坏条目，保留可用旧条目并继续分发其他 Registry。
+- [x] 统一 JSON 日志与级别，正常依赖等待和退出不产生业务错误噪声。
+- [x] 接入配置无效/所有权冲突 Event、Provider 与分发业务指标，以及采集失败和 Leader 标记。
+- [x] 提供监控 Service、NetworkPolicy、可选 ServiceMonitor、告警规则和 TLS/RBAC 配置。
+- [x] 验证告警规则、TLS 端点、双 Manager 指标切换与 5,000 Namespace 采集基准。
+- [ ] 在目标集群验收 ServiceMonitor、真实 RBAC/CNI/证书轮换、告警路由及收敛影响。
+
+## 已完成：运行参数配置
+
+- [x] 默认使用 QPS 25、Burst 50，以及两类资源 Controller 各 8 个 Worker。
+- [x] ConfigMap 暴露 `kubeAPIQPS`、`kubeAPIBurst`、`workers`，支持启动参数回退和整份配置校验。
+- [x] 两个副本均可原位热更新业务客户端限流，保持 ConfigMap 监听与 Lease 客户端独立。
+- [x] 启动前读取 Worker 配置，运行中变更记录重启要求；重启后按新数量创建 Worker。
+- [x] 纯运行参数变化不触发全量分发，并保留未完成的业务发布重试。
+- [x] 通过解析、并发、回退、真实客户端限流与 Worker 重启的单元测试和 envtest。
+- [x] 同步配置说明和性能测试默认值，保留 legacy profile 复现旧参数。
+
+## 下一里程碑：恢复与高可用
 
 - [ ] 实现从受管 Secret 按 RegistryKey 恢复最新有效凭证。
 - [ ] 实现部分分发恢复、Hash 冲突处理和全量重新收敛。
@@ -75,6 +95,5 @@
 - [ ] 实现 Leader Runtime recovery gate，并在恢复完成后开放凭证和资源写入。
 - [ ] 使用两个 Pod 验证 Leader 切换、Follower warmup 和丢失 Lease 后进程退出。
 - [x] 接入结构化日志、Manager 基础 Prometheus Metrics、Liveness 和配置 Readiness。
-- [ ] 实现 Kubernetes Event 和业务级 Prometheus Metrics。
 - [ ] 提供最小权限 RBAC、Deployment、ServiceAccount 和 ConfigMap 清单。
 - [ ] 编写 Kind 端到端测试与部署、升级、卸载说明。

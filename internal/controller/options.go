@@ -9,14 +9,16 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
 )
 
 const (
 	DefaultControllerNamespace                   = "registry-secret-controller-system"
 	DefaultConfigMapName                         = "registry-secret-controller-config"
 	DefaultManagedSecretName                     = "auto-patch-secret"
-	DefaultMaxConcurrentNamespaceReconciles      = 2
-	DefaultMaxConcurrentServiceAccountReconciles = 2
+	DefaultMaxConcurrentNamespaceReconciles      = config.DefaultWorkers
+	DefaultMaxConcurrentServiceAccountReconciles = config.DefaultWorkers
 
 	DefaultLeaderElectionID = "kubernetes-registry-secret-controller"
 
@@ -26,6 +28,9 @@ const (
 // ControllerOptions contains the fixed Kubernetes object identities and the
 // bounded concurrency used by the controllers registered with one Manager.
 type ControllerOptions struct {
+	// RuntimeUpdater is wired by startup to apply client tuning on each replica.
+	RuntimeUpdater RuntimeConfigurationUpdater
+
 	// ControllerNamespace is the namespace containing the controller's fixed
 	// configuration ConfigMap. It does not determine the namespace in which the
 	// controller Pod runs or restrict which namespaces the controller manages.

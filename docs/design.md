@@ -160,7 +160,7 @@ RegistryKey 聚合实例，将所有有效 Registry 的 Domain 写入同一个
 ServiceAccount Controller 按 Namespace/Name 独立调谐。匹配配置且输出
 Secret 已存在、未处于删除状态、明确受管且具有最小合法结构时，立即追加
 auto-patch-secret 引用，不调用 ACR。Secret 暂时不可用时不新增引用、保留已有引用，
-并通过限速队列重试；Secret Create 事件用于立即唤醒等待首次注入的对象。
+并通过 `RequeueAfter: 10s` 非错误重排；Secret Create 事件用于立即唤醒等待首次注入的对象。
 
 一期不修改 Pod。Kubernetes 只在 Pod 创建时从 ServiceAccount 复制
 imagePullSecrets。Namespace 创建后尽快创建 Secret 能缩小竞态窗口，但不
@@ -259,6 +259,9 @@ data:
   namespace: "*"
   excludeNamespace: "kube-system,kube-public,kube-node-lease,registry-secret-controller-system"
   serviceaccount: "default"
+  kubeAPIQPS: "25"
+  kubeAPIBurst: "50"
+  workers: "8"
 
   registries: |
     - regionID: cn-hangzhou
@@ -278,8 +281,8 @@ data:
 ~~~
 
 ConfigMap 中没有 ControllerConfiguration、apiVersion、kind、provider、
-identity、instanceType、enabled、beforeExpiry、jitter、secretName 或
-Worker 数量等内部配置。
+identity、instanceType、enabled、beforeExpiry、jitter 或 secretName 等内部配置。
+运行参数仅暴露 `kubeAPIQPS`、`kubeAPIBurst` 和 `workers`。
 
 ### 5.2 namespace
 
@@ -383,7 +386,11 @@ Configuration Controller 按 RegistryKey 分组：
 map[RegistryKey]RegistryConfig
 ~~~
 
-### 5.7 固定运行参数
+### 5.7 运行参数
+
+QPS/Burst 默认 25/50，通过 ConfigMap 热更新；`workers` 默认 8，分别用于两类
+资源 Controller，重启后生效。配置优先级、回退与生效范围见
+[运行参数配置](./runtime-configuration.md)。
 
 一期不在 ConfigMap 中暴露以下参数：
 
@@ -393,8 +400,6 @@ map[RegistryKey]RegistryConfig
 | 刷新提前量 | 5m |
 | Jitter | 无 |
 | Credential Worker | 2 |
-| Namespace Secret 最大并发 Reconcile | 2 |
-| ServiceAccount 最大并发 Reconcile | 2 |
 | Controller Pod 副本 | 2 |
 | Leader 写入者 | 1 |
 
@@ -694,8 +699,11 @@ List 以及 resourceVersion 未改变的 Resync 沿用 controller-runtime 的低
 - 不存在时创建；受管且漂移时更新；符合期望时不写；
 - 尚未取得任何凭据时不创建空 Secret；
 - 同名 Secret 只有两个 Controller 身份标签都匹配时才更新或删除，否则不覆盖；
-- Registry 已删除时移除对应 Auth；仍在配置但 Pending 时保留旧 Auth；
-- Namespace 离开目标范围时只删除明确受管的 Secret；
+- Registry 已删除时移除对应 Auth；Pending 时保留仍在配置中的旧域名 Auth 和原 State，
+  新域名等待取证；单个 Registry 损坏时仍分发其他可用条目，并返回脱敏错误供重试；
+- 无可用条目且构建失败时保留现有 Secret；
+- Namespace 离开目标范围时只删除明确受管的 Secret，删除携带观测到的 UID 与
+  resourceVersion 前置条件，防止误删并发替换或所有权已变化的对象；
 - 使用 resourceVersion 冲突重试，失败只重试该 Namespace，不重新调用 ACR。
 
 固定名称 Secret 的初始 List 和持续 Watch 同时用于恢复、漂移检测和调谐。
@@ -707,8 +715,8 @@ Reconcile 扫描全部 ServiceAccount。
 
 - 匹配配置且需要首次新增引用时，通过 Cache 确认固定名称 Secret 已存在、未在删除、
   两个 Controller 身份标签匹配、Type 正确且 `.dockerconfigjson` 非空；
-- Secret 尚未创建、正在删除或结构暂不完整时，不新增引用且不移除已有引用，并返回
-  可重试错误；Secret 创建事件立即入队该 Namespace 的目标 ServiceAccount；
+- Secret 尚未创建、正在删除或结构暂不完整时，不新增引用且不移除已有引用，Controller
+  将等待转换为 10 秒非错误重排；Secret 创建事件立即入队该 Namespace 的目标 ServiceAccount；
 - 配置变化时全量入队 ServiceAccount，以完成新增目标注入和旧目标清理；
 - 保留其他 imagePullSecrets，使用 resourceVersion 冲突重试；
 - 固定名称引用是 Controller 保留项，离开目标范围时移除；
@@ -726,7 +734,8 @@ ServiceAccount 引用就绪后创建；严格保证需要 Admission Webhook，�
 
 | 事件 | 动作 |
 | --- | --- |
-| ConfigMap 更新 | 原子更新 Store；全量入队 Namespace 和 ServiceAccount |
+| ConfigMap 业务配置更新 | 原子更新 Store；全量入队 Namespace 和 ServiceAccount |
+| ConfigMap 运行参数更新 | QPS/Burst 热更新；Worker 差异提示重启；不新增全量入队 |
 | ConfigMap 删除 | 继续使用最后一份有效配置，不清理 |
 | 实时 Namespace Create | 以高优先级入队该 Namespace，同步 Secret |
 | Namespace 更新、删除或配置范围变化 | 以普通优先级入队该 Namespace，同步或清理 Secret |
@@ -745,11 +754,14 @@ Secret。
 Configuration Controller 每次都先完整解析和规范化新配置，再原子替换当前配置。
 不允许应用半份配置。
 
-每次成功处理有效 ConfigMap 后都全量入队 Namespace 和 ServiceAccount。
-配置更新频率低，使用幂等全量收敛，不维护一次性的新旧差异队列。
+首次加载和有效业务配置变化时全量入队 Namespace 和 ServiceAccount；等价更新和
+纯运行参数更新不重复分发。发布失败后保留待完成标记，重试会继续发布，即使其间
+只有运行参数发生变化，也不会丢失先前的业务分发。
 
 | 配置差异 | 动作 |
 | --- | --- |
+| QPS/Burst 变化 | 原位调整业务客户端限流 |
+| workers 变化 | 记录实际/期望值和重启要求，当前并发不变 |
 | 新增 RegistryKey | 立即入 Credential Queue |
 | 删除 RegistryKey | 从 Store 删除，旧任务无操作，全部 Namespace 重同步 |
 | AK/SK 变化 | 立即重新取证 |
@@ -859,29 +871,9 @@ Secret 级别的保密语义。
 
 ## 16. 可观测性
 
-建议指标：
-
-- registry_secret_controller_provider_requests_total{region_id,instance_id,result}；
-- registry_secret_controller_provider_request_duration_seconds{region_id,instance_id}；
-- registry_secret_controller_credential_seconds_until_expiry{region_id,instance_id}；
-- registry_secret_controller_resource_sync_total{result}；
-- registry_secret_controller_resource_sync_duration_seconds；
-- registry_secret_controller_out_of_sync_namespaces；
-- registry_secret_controller_managed_namespaces；
-- registry_secret_controller_queue_depth{queue}；
-- registry_secret_controller_retries_total{queue,reason}。
-
-建议 Event：
-
-- CredentialRefreshed；
-- ProviderUnavailable；
-- CredentialExpired；
-- SecretCreated；
-- SecretRepaired；
-- ServiceAccountInjected；
-- OwnershipConflict；
-- InvalidConfiguration；
-- ConflictingCredentialsForRegistry。
+日志、指标、Event 和告警的具体方案以
+[日志与指标设计](./observability.md) 为准。复用 Manager 内置指标，新增业务指标分别
+表达内存凭据与已分发副本状态，已接入生产和 E2E 入口。以下探针语义保持不变。
 
 Readiness 条件：
 
@@ -949,7 +941,7 @@ Kubernetes 资源同步结果。
 - 同名非受管 Secret 不覆盖；
 - ServiceAccount 事件只调谐该对象，不扫描整个 Namespace；
 - Secret 不存在时不注入引用，创建事件触发目标 ServiceAccount；
-- Secret 暂时不存在、删除中或结构不完整时保留已有固定引用并限速重试；
+- Secret 暂时不存在、删除中或结构不完整时保留已有固定引用并非错误延迟重排；
 - 正常 Token 轮换不扇出或 Patch ServiceAccount；
 - 保留 SA 的其他 imagePullSecrets；
 - auto-patch-secret 引用不重复；
@@ -989,9 +981,9 @@ Kubernetes 资源同步结果。
 回退语义；受控性能测试在到期全量分发期间注入新 Namespace，验证当前代凭据、
 ServiceAccount 就绪时间以及对原全量分发吞吐的影响。
 
-Manager 集成测试关闭监听端口和 Leader Election，使用真实 API Server 验证
-精确 Cache、初始 List、持续 Watch、标准 Queue 重试和优雅停止。双副本
-Leader Election、warmup 和恢复顺序在 Kind 测试中验证。
+基础 Manager 集成测试使用真实 API Server 验证精确 Cache、初始 List、持续 Watch、
+标准 Queue 重试和优雅停止。可观测性集成测试另行验证 TLS 指标端点和双 Manager
+切换后的指标归属；真实 Pod 的 warmup、凭据恢复和丢失 Lease 后退出仍需 Kind 验证。
 
 测试使用 Fake Provider 和 Fake Clock，不依赖真实等待时间。
 
@@ -1054,8 +1046,9 @@ Deployment 固定 replicas: 2，并启用 Leader Election。滚动升级期间�
 Kubernetes API 客户端限流可通过 `--kube-api-qps` 和 `--kube-api-burst`
 配置；Namespace Secret 与 ServiceAccount 调谐并发分别通过
 `--max-concurrent-namespace-reconciles` 和
-`--max-concurrent-service-account-reconciles` 配置。默认值保持 client-go
-兼容的 QPS 5、Burst 10，以及两类 Controller 各 2 个并发 Worker。
+`--max-concurrent-service-account-reconciles` 配置。默认值为 QPS 25、Burst 50，
+以及两类 Controller 各 8 个 Worker。有效 ConfigMap 字段覆盖相应启动参数；
+QPS/Burst 热更新，Worker 在创建 Manager 前读取，修改后重启进程生效。
 
 卸载步骤：
 

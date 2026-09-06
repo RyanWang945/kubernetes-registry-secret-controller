@@ -1,0 +1,23 @@
+# JSON merge patch for servicemonitor.yaml. The CA Secret must be in the
+# same namespace as this ServiceMonitor. The serving certificate must cover
+# the DNS name below. This reads Prometheus's projected, rotating SA token;
+# the Operator must permit filesystem references in ServiceMonitors.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: registry-secret-controller
+  namespace: registry-secret-controller-system
+spec:
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 5s
+      scheme: https
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        serverName: registry-secret-controller-metrics.registry-secret-controller-system.svc
+        ca:
+          secret:
+            name: registry-secret-controller-metrics-ca
+            key: ca.crt

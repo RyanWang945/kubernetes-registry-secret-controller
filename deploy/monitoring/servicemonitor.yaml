@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: registry-secret-controller
+  namespace: registry-secret-controller-system
+  labels:
+    app.kubernetes.io/name: kubernetes-registry-secret-controller
+spec:
+  jobLabel: observability-job
+  namespaceSelector:
+    matchNames: [registry-secret-controller-system]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubernetes-registry-secret-controller
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 5s

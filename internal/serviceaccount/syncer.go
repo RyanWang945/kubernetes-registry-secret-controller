@@ -9,6 +9,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/registrysecret"
@@ -71,6 +72,7 @@ func (s *Syncer) SyncServiceAccount(ctx context.Context, key types.NamespacedNam
 
 	desiredReferences := reconcileReferences(serviceAccount.ImagePullSecrets, s.secretName, shouldReference)
 	if equalReferences(serviceAccount.ImagePullSecrets, desiredReferences) {
+		log.FromContext(ctx).V(1).Info("ServiceAccount is unchanged", "namespace", key.Namespace, "name", key.Name, "operation", "sync_serviceaccount")
 		return nil
 	}
 	base := serviceAccount.DeepCopy()
@@ -79,6 +81,7 @@ func (s *Syncer) SyncServiceAccount(ctx context.Context, key types.NamespacedNam
 	if err := s.client.Patch(ctx, serviceAccount, patch); err != nil {
 		return fmt.Errorf("patch ServiceAccount %s imagePullSecrets: %w", key, err)
 	}
+	log.FromContext(ctx).V(1).Info("updated ServiceAccount imagePullSecrets", "namespace", key.Namespace, "name", key.Name, "operation", "patch_serviceaccount")
 	return nil
 }
 

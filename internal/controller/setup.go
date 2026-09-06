@@ -73,7 +73,7 @@ func SetupWithManager(
 			MaxConcurrentReconciles: options.MaxConcurrentNamespaceReconciles,
 			NeedLeaderElection:      ptr.To(true),
 			EnableWarmup:            ptr.To(true),
-			UsePriorityQueue:         ptr.To(true),
+			UsePriorityQueue:        ptr.To(true),
 		}).
 		Complete(namespaceReconciler); err != nil {
 		return fmt.Errorf("register namespace Secret controller: %w", err)
@@ -108,6 +108,7 @@ func SetupWithManager(
 		observer:  configurationObserver,
 		publisher: resourceEvents,
 		options:   options,
+		recorder:  mgr.GetEventRecorderFor("configuration"),
 	}
 	configMapPredicate := predicate.NewPredicateFuncs(func(object client.Object) bool {
 		return object.GetNamespace() == options.ControllerNamespace && object.GetName() == options.ConfigMapName
@@ -147,6 +148,9 @@ func mapManagedSecretToServiceAccounts(
 
 		serviceAccounts := &corev1.ServiceAccountList{}
 		if err := reader.List(ctx, serviceAccounts, client.InNamespace(secret.Namespace)); err != nil {
+			if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+				return nil
+			}
 			log.FromContext(ctx).Error(
 				err,
 				"list ServiceAccounts after managed Secret creation",

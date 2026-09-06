@@ -246,6 +246,7 @@ func (s *Scheduler) runWorker(ctx context.Context) {
 			err,
 			"credential reconciliation failed",
 			"registry", key.String(),
+			"operation", "refresh_credential",
 			"retry", s.queue.NumRequeues(key)+1,
 		)
 		s.queue.AddRateLimited(key)
@@ -276,6 +277,7 @@ func (s *Scheduler) refresh(ctx context.Context, key config.RegistryKey) error {
 	}
 
 	requestCtx, cancel := context.WithTimeout(ctx, s.options.RequestTimeout)
+	started := time.Now()
 	token, err := s.provider.GetAuthorizationToken(requestCtx, Request{
 		Key:             key,
 		AccessKeyID:     registry.AccessKeyID,
@@ -315,6 +317,8 @@ func (s *Scheduler) refresh(ctx context.Context, key config.RegistryKey) error {
 	log.FromContext(ctx).Info(
 		"installed refreshed credential",
 		"registry", key.String(),
+		"operation", "refresh_credential",
+		"duration_seconds", time.Since(started).Seconds(),
 		"expires_at", token.ExpiresAt,
 	)
 

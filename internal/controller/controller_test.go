@@ -1,8 +1,12 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -22,7 +27,113 @@ import (
 
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/config"
 	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/registrysecret"
+	"github.com/RyanWang945/kubernetes-registry-secret-controller/internal/serviceaccount"
 )
+
+func TestServiceAccountDependencyWaitIsNotAnError(t *testing.T) {
+	store := &config.Store{}
+	store.Apply(config.ConfigurationSnapshot{})
+	syncer := newRecordingSyncer(func(int, string) error { return serviceaccount.ErrManagedSecretNotReady })
+	r := &ServiceAccountReconciler{store: store, syncer: syncer}
+	result, err := r.Reconcile(testContext(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "production", Name: "default"}})
+	if err != nil || result.RequeueAfter != 10*time.Second {
+		t.Fatalf("result=%+v, error=%v", result, err)
+	}
+}
+
+func TestShutdownCancellationDoesNotBecomeReconcileError(t *testing.T) {
+	store := &config.Store{}
+	store.Apply(config.ConfigurationSnapshot{})
+	syncer := newRecordingSyncer(func(int, string) error { return context.Canceled })
+	options := ControllerOptions{}.withDefaults()
+	configuration := &ConfigurationReconciler{client: canceledClient{}, store: store, options: options}
+	namespace := &NamespaceSecretReconciler{store: store, syncer: syncer}
+	account := &ServiceAccountReconciler{store: store, syncer: syncer}
+	for _, tc := range []struct {
+		name       string
+		reconciler reconcile.Reconciler
+		key        types.NamespacedName
+	}{
+		{"configuration", configuration, types.NamespacedName{Namespace: options.ControllerNamespace, Name: options.ConfigMapName}},
+		{"namespace", namespace, types.NamespacedName{Name: "production"}},
+		{"serviceaccount", account, types.NamespacedName{Namespace: "production", Name: "default"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if _, err := tc.reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: tc.key}); err != nil {
+				t.Fatalf("shutdown produced an error: %v", err)
+			}
+			if _, err := tc.reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: tc.key}); err == nil {
+				t.Fatal("independent operation cancellation must still retry")
+			}
+		})
+	}
+}
+
+type canceledClient struct{ client.Client }
+
+func (canceledClient) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return context.Canceled
+}
+
+func TestInvalidConfigurationEventIsDeduplicatedAndRedacted(t *testing.T) {
+	cm := testConfigMap("production", "default")
+	cm.Data[config.RegistriesKey] = "- sensitive-unknown-key: sensitive-token"
+	kube := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(cm).Build()
+	store := &config.Store{}
+	good, err := config.Parse(testConfigMap("production", "default").Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Apply(good)
+	recorder := record.NewFakeRecorder(10)
+	r := &ConfigurationReconciler{client: kube, store: store, observer: &recordingConfigurationObserver{}, publisher: mustResourceEventPublisher(t, kube), options: ControllerOptions{}.withDefaults(), recorder: recorder}
+	var output bytes.Buffer
+	logger := logr.FromSlogHandler(slog.NewJSONHandler(&output, nil))
+	ctx := log.IntoContext(context.Background(), logger)
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cm)}
+	for range 2 {
+		if _, err := r.Reconcile(ctx, request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if store.Valid() || !store.Loaded() {
+		t.Fatal("latest invalid state or last good snapshot is incorrect")
+	}
+	if strings.Contains(output.String(), "sensitive") {
+		t.Fatal("configuration parser leaked sensitive input")
+	}
+	if len(strings.Split(strings.TrimSpace(output.String()), "\n")) != 1 {
+		t.Fatal("repeated configuration rejection logged more than once")
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(output.Bytes(), &entry); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-recorder.Events:
+		if !strings.Contains(event, "InvalidConfiguration") || strings.Contains(event, "sensitive") {
+			t.Fatal("invalid event payload")
+		}
+	default:
+		t.Fatal("missing warning event")
+	}
+	select {
+	case <-recorder.Events:
+		t.Fatal("duplicate warning event")
+	default:
+	}
+	if err := kube.Delete(ctx, cm); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	if store.Valid() || !store.Loaded() {
+		t.Fatal("configuration deletion discarded last good state")
+	}
+}
 
 const testRegistries = `
 - regionID: cn-hangzhou
@@ -89,10 +200,10 @@ func TestConfigurationReconcilerAppliesAndFansOut(t *testing.T) {
 	if unchanged.Generation != 1 {
 		t.Fatalf("equivalent configuration generation = %d, want 1", unchanged.Generation)
 	}
-	assertNamespaceEvents(t, publisher.namespaceEvents, "ignored", "production")
-	assertServiceAccountEvents(t, publisher.serviceAccountEvents, "ignored/other", "production/default")
-	if observer.count() != 2 {
-		t.Fatalf("configuration notifications = %d, want 2", observer.count())
+	assertNoEvent(t, publisher.namespaceEvents, "Namespace")
+	assertNoEvent(t, publisher.serviceAccountEvents, "ServiceAccount")
+	if observer.count() != 1 {
+		t.Fatalf("configuration notifications = %d, want 1", observer.count())
 	}
 }
 
