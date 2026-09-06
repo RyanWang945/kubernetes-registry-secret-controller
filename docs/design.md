@@ -161,7 +161,8 @@ ServiceAccount Controller 按 Namespace/Name 独立调谐。实时 Create 使用
 先于尚未执行的普通配置分发项；初始 List 不视为实时新增。匹配配置且输出
 Secret 已存在、未处于删除状态、明确受管且具有最小合法结构时，立即追加
 auto-patch-secret 引用，不调用 ACR。Secret 暂时不可用时不新增引用、保留已有引用，
-并通过 `RequeueAfter: 500ms` 非错误重排；Secret Create 事件用于立即唤醒等待首次注入的对象。
+并通过 `RequeueAfter` 按 SA 独立指数退避：100ms、200ms、400ms、800ms、1.6s、3.2s，
+之后以 5s 封顶；成功后清零。Secret Create 事件用于立即唤醒等待首次注入的对象。
 
 一期不修改 Pod。Kubernetes 只在 Pod 创建时从 ServiceAccount 复制
 imagePullSecrets。Namespace 创建后尽快创建 Secret 能缩小竞态窗口，但不
@@ -722,7 +723,8 @@ Reconcile 扫描全部 ServiceAccount。
 - 匹配配置且需要首次新增引用时，通过 Cache 确认固定名称 Secret 已存在、未在删除、
   两个 Controller 身份标签匹配、Type 正确且 `.dockerconfigjson` 非空；
 - Secret 尚未创建、正在删除或结构暂不完整时，不新增引用且不移除已有引用，Controller
-  将等待转换为 500 毫秒非错误重排；Secret 创建事件立即入队该 Namespace 的目标 ServiceAccount；
+  将等待转换为按 Namespace/Name 独立的非错误指数退避，从 100 毫秒起翻倍，最长 5 秒；
+  成功、对象消失或退出目标范围后清除计数。Secret 创建事件立即入队该 Namespace 的目标 ServiceAccount；
 - 配置变化时全量入队 ServiceAccount，以完成新增目标注入和旧目标清理；
 - 保留其他 imagePullSecrets，使用 resourceVersion 冲突重试；
 - 固定名称引用是 Controller 保留项，离开目标范围时移除；

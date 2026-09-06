@@ -34,9 +34,9 @@ func TestServiceAccountDependencyWaitIsNotAnError(t *testing.T) {
 	store := &config.Store{}
 	store.Apply(config.ConfigurationSnapshot{})
 	syncer := newRecordingSyncer(func(int, string) error { return serviceaccount.ErrManagedSecretNotReady })
-	r := &ServiceAccountReconciler{store: store, syncer: syncer}
+	r := newServiceAccountReconciler(store, syncer)
 	result, err := r.Reconcile(testContext(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "production", Name: "default"}})
-	if err != nil || result.RequeueAfter != 500*time.Millisecond {
+	if err != nil || result.RequeueAfter != 100*time.Millisecond {
 		t.Fatalf("result=%+v, error=%v", result, err)
 	}
 }
@@ -48,7 +48,7 @@ func TestShutdownCancellationDoesNotBecomeReconcileError(t *testing.T) {
 	options := ControllerOptions{}.withDefaults()
 	configuration := &ConfigurationReconciler{client: canceledClient{}, store: store, options: options}
 	namespace := &NamespaceSecretReconciler{store: store, syncer: syncer}
-	account := &ServiceAccountReconciler{store: store, syncer: syncer}
+	account := newServiceAccountReconciler(store, syncer)
 	for _, tc := range []struct {
 		name       string
 		reconciler reconcile.Reconciler
@@ -368,7 +368,7 @@ func TestServiceAccountReconcilerPreservesObjectKeyAndReturnsErrors(t *testing.T
 		}
 		return nil
 	})
-	reconciler := &ServiceAccountReconciler{store: store, syncer: recorder}
+	reconciler := newServiceAccountReconciler(store, recorder)
 	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "production", Name: "build"}}
 
 	if _, err := reconciler.Reconcile(testContext(), request); err != nil {

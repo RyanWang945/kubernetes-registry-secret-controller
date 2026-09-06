@@ -79,7 +79,7 @@ func SetupWithManager(
 		return fmt.Errorf("register namespace Secret controller: %w", err)
 	}
 
-	serviceAccountReconciler := &ServiceAccountReconciler{store: store, syncer: serviceAccountSyncer}
+	serviceAccountReconciler := newServiceAccountReconciler(store, serviceAccountSyncer)
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("service_accounts").
 		Watches(&corev1.ServiceAccount{}, &serviceAccountEventHandler{}).

@@ -46,10 +46,14 @@ Namespace 的固定名称 Secret，并检查：
   `imagePullSecrets`；
 - Secret 满足最小校验：确保固定引用恰好存在一次；
 - Secret 不存在、正在删除或结构不完整：不新增引用，也不移除已经存在的固定引用，
-  Syncer 返回 `ManagedSecretNotReady`，Controller 转换为 `RequeueAfter: 500ms` 非错误重排；
+  Syncer 返回 `ManagedSecretNotReady`，Controller 转换为 `RequeueAfter` 非错误指数退避；
 - 同名 Secret 存在但不受管：不新增引用；已有固定引用时将其移除。所有权冲突由
   Namespace Secret Controller 记录 Error 日志并产生 Kubernetes Warning Event，
   不按 ServiceAccount 重复告警。
+
+依赖等待按 Namespace/Name 独立计数：100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 5s，
+之后保持 5s。每项是本次调谐结束后的等待间隔。成功、SA 已删除或退出目标范围时清除计数；
+普通 API 错误继续使用工作队列的错误重试，不增加依赖等待计数。Secret Create 事件仍可提前唤醒。
 
 实时 ServiceAccount Create 以优先级 100 入队，先于普通配置分发，并按 Namespace/Name
 去重；初始 List 和未变化的 Resync 保持低优先级，普通 Update/Delete 和配置分发使用

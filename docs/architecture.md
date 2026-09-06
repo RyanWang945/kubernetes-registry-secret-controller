@@ -22,7 +22,8 @@ Secret 及其 Watch 事件协作。
 3. Secret 存在、未删除、受管且结构完整时，使用 optimistic-lock Patch 确保固定引用
    恰好存在一次。
 4. Secret 不存在、正在删除或结构不完整时，不新增也不移除固定引用，Controller 以
-   500 毫秒非错误重排兜底；Secret Create 事件会立即唤醒等待对象。
+   100 毫秒起、最长 5 秒的非错误指数退避兜底，按 SA 独立计数，成功后清零；
+   Secret Create 事件会立即唤醒等待对象。
 5. 同名 Secret 不受管时不新增引用，并清理可能遗留的固定引用；所有权冲突由
    Namespace Secret Controller 集中告警。
 
