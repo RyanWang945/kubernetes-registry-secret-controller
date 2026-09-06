@@ -82,7 +82,7 @@ func SetupWithManager(
 	serviceAccountReconciler := &ServiceAccountReconciler{store: store, syncer: serviceAccountSyncer}
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("service_accounts").
-		For(&corev1.ServiceAccount{}).
+		Watches(&corev1.ServiceAccount{}, &serviceAccountEventHandler{}).
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(mapManagedSecretToServiceAccounts(
@@ -97,6 +97,7 @@ func SetupWithManager(
 			MaxConcurrentReconciles: options.MaxConcurrentServiceAccountReconciles,
 			NeedLeaderElection:      ptr.To(true),
 			EnableWarmup:            ptr.To(true),
+			UsePriorityQueue:        ptr.To(true),
 		}).
 		Complete(serviceAccountReconciler); err != nil {
 		return fmt.Errorf("register ServiceAccount controller: %w", err)

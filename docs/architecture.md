@@ -15,7 +15,9 @@ Secret 及其 Watch 事件协作。
 
 ## 用户创建 ServiceAccount
 
-1. ServiceAccount Create/Update 事件把 `namespace/name` 放入 SA Controller 队列。
+1. ServiceAccount 事件把 `namespace/name` 放入 SA Controller 队列。实时 Create
+   使用优先级 100，先于普通配置分发；初始 List 和未变化的 Resync 保持低优先级，
+   普通 Update/Delete 和配置分发使用默认优先级。
 2. Syncer 读取最新配置，并通过 Manager Cache 读取同 Namespace 的固定名称 Secret。
 3. Secret 存在、未删除、受管且结构完整时，使用 optimistic-lock Patch 确保固定引用
    恰好存在一次。
@@ -26,6 +28,10 @@ Secret 及其 Watch 事件协作。
 
 Patch 前读取走 Manager Cache，不会为每个 ServiceAccount 调用 ACR。大量创建时的
 主要成本是逐个写入 ServiceAccount，而不是 Secret 状态判断。
+
+新建 SA 的依赖等待和错误重试由队列保留原优先级；Secret Create 事件可以提前唤醒
+等待项。优先级不抢占正在执行的调谐，也不绕过 Secret 校验或 API 限流，不保证
+Patch 一定先于 Pod 创建完成。
 
 ## 用户修改 ConfigMap
 

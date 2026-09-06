@@ -157,7 +157,8 @@ RegistryKey 聚合实例，将所有有效 Registry 的 Domain 写入同一个
 
 ### 3.4 新增 ServiceAccount
 
-ServiceAccount Controller 按 Namespace/Name 独立调谐。匹配配置且输出
+ServiceAccount Controller 按 Namespace/Name 独立调谐。实时 Create 使用优先级 100，
+先于尚未执行的普通配置分发项；初始 List 不视为实时新增。匹配配置且输出
 Secret 已存在、未处于删除状态、明确受管且具有最小合法结构时，立即追加
 auto-patch-secret 引用，不调用 ACR。Secret 暂时不可用时不新增引用、保留已有引用，
 并通过 `RequeueAfter: 10s` 非错误重排；Secret Create 事件用于立即唤醒等待首次注入的对象。
@@ -713,6 +714,11 @@ List 以及 resourceVersion 未改变的 Resync 沿用 controller-runtime 的低
 队列 Key 是 ServiceAccount 的 Namespace/Name，独立有界并发，不由 Namespace
 Reconcile 扫描全部 ServiceAccount。
 
+- 显式启用优先级队列，实时 ServiceAccount Create 使用优先级 100，普通 Update/Delete、
+  配置分发和 Secret 事件使用默认优先级 0，初始 List 和未变化的 Resync 使用低优先级
+  -100；同一个已排队 Key 收到实时 Create 时直接提升，不产生重复项；
+- 依赖等待和错误重试保留原调谐优先级。优先级不抢占运行中的调谐，不绕过 Secret
+  就绪检查或 Kubernetes 客户端限流，也不保证 Patch 先于 Pod 创建完成；
 - 匹配配置且需要首次新增引用时，通过 Cache 确认固定名称 Secret 已存在、未在删除、
   两个 Controller 身份标签匹配、Type 正确且 `.dockerconfigjson` 非空；
 - Secret 尚未创建、正在删除或结构暂不完整时，不新增引用且不移除已有引用，Controller
@@ -739,7 +745,8 @@ ServiceAccount 引用就绪后创建；严格保证需要 Admission Webhook，�
 | ConfigMap 删除 | 继续使用最后一份有效配置，不清理 |
 | 实时 Namespace Create | 以高优先级入队该 Namespace，同步 Secret |
 | Namespace 更新、删除或配置范围变化 | 以普通优先级入队该 Namespace，同步或清理 Secret |
-| ServiceAccount 创建或变化 | 入队该 ServiceAccount |
+| 实时 ServiceAccount Create | 以高优先级入队该 ServiceAccount，校验 Secret 后注入引用 |
+| ServiceAccount 更新或删除 | 以默认优先级入队该 ServiceAccount；未变化的 Resync 保持低优先级 |
 | 输出 Secret 创建 | 入队该 Namespace 的目标 ServiceAccount |
 | 输出 Secret 受管身份变化 | 入队该 Namespace 的目标 ServiceAccount |
 | 输出 Secret 删除或漂移 | 入队所在 Namespace，修复 Secret |

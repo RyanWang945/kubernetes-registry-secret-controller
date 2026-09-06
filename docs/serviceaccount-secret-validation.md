@@ -51,6 +51,11 @@ Namespace 的固定名称 Secret，并检查：
   Namespace Secret Controller 记录 Error 日志并产生 Kubernetes Warning Event，
   不按 ServiceAccount 重复告警。
 
+实时 ServiceAccount Create 以优先级 100 入队，先于普通配置分发，并按 Namespace/Name
+去重；初始 List 和未变化的 Resync 保持低优先级，普通 Update/Delete 和配置分发使用
+默认优先级。依赖等待和错误重试保留原调谐优先级，不抢占正在执行的任务，也不绕过
+Secret 校验与 API 限流。
+
 Secret Create 事件用于立即唤醒同 Namespace 中等待首次注入的目标 ServiceAccount；
 延迟重排作为事件延迟或丢失时的兜底。Secret Update 只在受管身份发生变化时扇出
 ServiceAccount，正常 Token 轮换和内容修复不触发 SA 全量调谐。Secret Delete 由
@@ -80,4 +85,6 @@ Cache 可能短暂返回旧对象，本方案只保证最终收敛。保留稳�
 - Secret 受管身份发生变化时重新调谐，普通 Token/Data Update 不扇出
   ServiceAccount；
 - Patch 冲突和 Secret 读取错误由 Controller 限速重试；
+- 实时 SA Create 先于普通配置分发处理，同名不同 Namespace 的 SA 保持独立 Key，
+  已排队的 Key 可提升优先级且不重复入队；初始 List 和普通事件不升级为实时 Create 优先级；
 - 批量创建 ServiceAccount 时不产生逐个 ACR 请求，也不因正常 Token 轮换全量 Patch。

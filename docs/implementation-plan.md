@@ -38,6 +38,7 @@
 - [x] 在有效配置变化和受管 Secret 创建时入队相关 ServiceAccount。
 - [x] 为两个资源 Controller 分别配置有界并发、Leader Election 和 warmup。
 - [x] 更新单元测试和 envtest，验证对象级 Key、事件 fan-out 和独立重试。
+- [x] 实时 ServiceAccount Create 以优先级 100 入队，保留初始 List 和普通事件优先级；验证抢先出队、Key 去重与提升，并通过 Manager 监听及实际 Patch 的 envtest 回归。
 
 ## 已完成里程碑：凭证获取与调度
 
