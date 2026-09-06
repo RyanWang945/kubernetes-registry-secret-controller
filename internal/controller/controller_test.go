@@ -36,7 +36,7 @@ func TestServiceAccountDependencyWaitIsNotAnError(t *testing.T) {
 	syncer := newRecordingSyncer(func(int, string) error { return serviceaccount.ErrManagedSecretNotReady })
 	r := &ServiceAccountReconciler{store: store, syncer: syncer}
 	result, err := r.Reconcile(testContext(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "production", Name: "default"}})
-	if err != nil || result.RequeueAfter != 10*time.Second {
+	if err != nil || result.RequeueAfter != 500*time.Millisecond {
 		t.Fatalf("result=%+v, error=%v", result, err)
 	}
 }

@@ -34,7 +34,7 @@ func (r *ServiceAccountReconciler) Reconcile(ctx context.Context, request ctrl.R
 	if err := r.syncer.SyncServiceAccount(ctx, request.NamespacedName); err != nil {
 		if errors.Is(err, serviceaccount.ErrManagedSecretNotReady) {
 			log.FromContext(ctx).V(1).Info("waiting for managed Secret", "operation", "sync_serviceaccount", "reason", "ManagedSecretNotReady")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			return ctrl.Result{RequeueAfter: 500 * time.Millisecond}, nil
 		}
 		if ctx.Err() != nil && errors.Is(err, context.Canceled) {
 			return ctrl.Result{}, nil

@@ -33,7 +33,7 @@ controller-runtime Metrics Server 和 Kubernetes Event，接入集群已有日�
 | 正常退出导致的取消 | 不记录业务错误 |
 
 ServiceAccount Reconciler 将 `ErrManagedSecretNotReady` 转换为非错误的
-`RequeueAfter: 10s`；Secret Create 事件仍可提前唤醒，不修改已有稳定引用。
+`RequeueAfter: 500ms`；Secret Create 事件仍可提前唤醒，不修改已有稳定引用。
 此项替代原方案中通过 Reconcile 错误表达正常依赖等待的行为。
 
 Event 首版保留 `InvalidConfiguration` 和 `OwnershipConflict`，分别关联配置对象

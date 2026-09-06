@@ -46,7 +46,7 @@ Namespace 的固定名称 Secret，并检查：
   `imagePullSecrets`；
 - Secret 满足最小校验：确保固定引用恰好存在一次；
 - Secret 不存在、正在删除或结构不完整：不新增引用，也不移除已经存在的固定引用，
-  Syncer 返回 `ManagedSecretNotReady`，Controller 转换为 `RequeueAfter: 10s` 非错误重排；
+  Syncer 返回 `ManagedSecretNotReady`，Controller 转换为 `RequeueAfter: 500ms` 非错误重排；
 - 同名 Secret 存在但不受管：不新增引用；已有固定引用时将其移除。所有权冲突由
   Namespace Secret Controller 记录 Error 日志并产生 Kubernetes Warning Event，
   不按 ServiceAccount 重复告警。
