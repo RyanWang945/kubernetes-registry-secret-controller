@@ -1,0 +1,140 @@
+{
+  "build": {
+    "image": "docker.io/library/kubernetes-registry-secret-controller:blog-20260906",
+    "binarySHA256": "57184c811102d839b178d388ddf8331aadcc525af2343be80a6642b6ee5a0a42",
+    "configSHA256": "4c1d602589463eccd1700b3f157c6e8f8ad30d19043cbd95c8ca195311c3ee51",
+    "driverBinarySHA256": "be412c847d7c0cb6274824d432afa73a192f701d91d9e2def744cae8f8b01c25"
+  },
+  "sourceSHA256": {
+    "cmd/e2e-controller/clock_control.go": "5f8e00184f2d3a1e00ceaa948f1cbdd53e199a739677e7b9c3afab6baf36e9b2",
+    "cmd/e2e-controller/clock_control_test.go": "60d72539a6770c3bcd4b894affff36cc40aae66f7be1ea4712f5370b42dbcf59",
+    "cmd/e2e-controller/main.go": "950a22e3e5e06ef46aaa8ff1b6c4db21904b8bbcecc153d769e054916d696a08",
+    "cmd/e2e-controller/main_test.go": "c4bf25128d7c5e3945b71422e817e131eacd65797cec3ea4bd34a9a4f47567b8",
+    "cmd/perf-driver/main.go": "037ca073a9efd8a34b6069560c0209c96efa0341029725cd092829737293148e",
+    "cmd/perf-driver/main_test.go": "e8cdb3458f8e234aadfa17ff7dcc8787163560ffcd6fc86d4233b73e712cbf25",
+    "cmd/perf-driver/mutation.go": "01b9af372aaf6df00666b46903600ac2b98b4fe6cde36690039ac351588213c4",
+    "cmd/perf-driver/observer.go": "8b5cfcb79c5da31fb68018dbc6f6e75c5438aa95d475f59ce87c9926461134ea",
+    "cmd/perf-driver/profile.go": "b2811cc6251da9af531689e9b5fb4e12b8d73a58d6acd447cc14b6719d03e45c",
+    "cmd/perf-driver/profile_test.go": "7985433884427d79d7c84394dfc2884983156759eb7bb45979478e6541481feb",
+    "cmd/perf-driver/resources.go": "cb3c5a1c92735fb42c408570efa1fbec195e15a619e45fab7aad26923e0fd34c",
+    "cmd/perf-driver/tracker.go": "cf231604079a23c665640377e87bf87e257903ea1ded21f67e283a8c785d9a2c",
+    "cmd/perf-driver/tracker_test.go": "6621e410c86148d69177a87cc8e21220694d3cbb9403c5bb59f440b96061b628",
+    "cmd/perf-driver/verify_test.go": "a60d6da2a4840ef94032567ae322ffa24ee50170514f98aa760830cafae85272",
+    "go.mod": "7dc76a94416d89d747fbafa4a498babd9812f36911276b4ac222441ee0460b68",
+    "go.sum": "53d95c3ad9cea4da998c1b51d2bca0c9da1f537b7199824805f98e9d71f5ce0f",
+    "internal/config/parser.go": "f628e515522b9d0696d813df6617e4e6a8fafd22b67d23e98485f896521f840b",
+    "internal/config/parser_test.go": "8581c1d89c0bafaf29caa5ed1aae5019848a5cbd4ca01324db5805b6deb10a70",
+    "internal/config/runtime.go": "520db613aadc5b19abb17aa0d8beb71538146105a43f4c73598046cf784a1248",
+    "internal/config/runtime_test.go": "64cb185a1a74cacc218633a4da6b51f6f43b2e8224dd020b68de55cc0f42edbe",
+    "internal/config/store.go": "5c20ce7f369af91491dbbabfdbfe127f86fb3e5b78bee1f6f052a4c1f50268df",
+    "internal/config/store_test.go": "f66c925c9c0b8193d663bcde448175c73dddb87bdb57014f7ec421e657703dac",
+    "internal/config/types.go": "23ff8f807532eb5d75c66669bcffa61f44a151be343a2eabf5c8a48b2f24a0a9",
+    "internal/controller/configuration_reconciler.go": "41ab1c4c8c71b01082bc3a3c7e64d7b80655084e9aedc4faa1e256b538fa6e6e",
+    "internal/controller/controller_envtest_test.go": "5a5a8dba113b6b4d65a440c38935c4ede72865af4f18c9325e33e76a3978a69e",
+    "internal/controller/controller_test.go": "076c221bd3f6e2823edacef5195fd97fa203493de21c760997876b3ed2bedfa9",
+    "internal/controller/namespace_event_handler.go": "27c76fe236ea8db7bf3ef07129ec8c820f5afc5bbd32cddd35c45467112d07ea",
+    "internal/controller/namespace_event_handler_test.go": "873fe41106a9d4d9fd088e2515707730e120d104d44e92e2de72707e9e4a088e",
+    "internal/controller/namespace_reconciler.go": "ceffe82e8462701b29793b19e5af8e7381f05982848567c40a68c93620ca4d74",
+    "internal/controller/options.go": "052934b9f962ac174dd102e06eff41d614b963263bd3b23351637490d9a724b7",
+    "internal/controller/readiness.go": "81510d0b5332a5a930b2b60431511a1906e5e55e3c5adb24e42c69f89d88294a",
+    "internal/controller/resource_events.go": "ddc7327b4f8168bfbab730d0ff287ba43b76daca8aa70e4467512a7c109310f7",
+    "internal/controller/runtime_envtest_test.go": "a89b82c9c5cb7f61a89e780ac9aa211d8691803dfef6e97b66fa63efcbfd815b",
+    "internal/controller/runtime_test.go": "8ddb1259f27e54e15ae513d603ecdd497f0f2c6eb242fd758c9b95b4164d3aab",
+    "internal/controller/serviceaccount_event_handler.go": "f3b31b14307e39b234a950c30337639ad5ab2ab74cee68bdb7a5f92385db51d8",
+    "internal/controller/serviceaccount_event_handler_test.go": "034c130194e807c51c2174c6eca8ddf9370021634f430c7188a3f8e03ee56064",
+    "internal/controller/serviceaccount_reconciler.go": "1c65f8b99edd438321906c9cb54d194f112590d77b68217f9224011493960708",
+    "internal/controller/setup.go": "5f5d4523d5dc308d213a69082201d4122851b47507790a5e32a26c5e0a50687b",
+    "internal/credential/acr_provider.go": "047d357547adaacb20ce59f4b2cbae68270de3696f69e8ef8ed5ba083132bc68",
+    "internal/credential/acr_provider_test.go": "c19b86fba8a59692bac481280fa0d8ee18ff4837a054e770ab835796cb509851",
+    "internal/credential/scheduler.go": "5622e97bfe7b1b7b6b5210c5f5ea132e1bb9fec87823888d0a7fedbebc12b791",
+    "internal/credential/scheduler_test.go": "b02ca380fa316fde1762bcc6ef838e95b3a68b699e2ee9abdbc72ac7a0d0ad1b",
+    "internal/credential/store.go": "840ee576c80463c26b875ea1ff8f3be4f74c60ec75397c1c2c61a07292e96c28",
+    "internal/credential/store_test.go": "bde0d5e16444bda5febdc7d0d2d3f6d48409547413682067cd05f86c8b6603e0",
+    "internal/credential/types.go": "f6f1d8464e5f7bb92e460854c353bfd96348126ce7f9cdefe1300b9dbf3d46a1",
+    "internal/kubeclient/bootstrap.go": "4b6a4da378ce46d8916e68b8ef396998b2f9cac47670fec1c84b5b4f531feedc",
+    "internal/kubeclient/limiter.go": "bb65e5c462c3426159df83384c555b62d1537f6ffad099f41c8e4eb70770f0cf",
+    "internal/kubeclient/runtime.go": "641147db9c50e46b6a24c1a08a37b23e14c3582e9a5c2adb912519d8b6a5a0c7",
+    "internal/kubeclient/runtime_test.go": "c10532c821ef4360a700e165860d99a41a43dd166e11e66720ae899b949a388a",
+    "internal/observability/logging.go": "1a5a884fdd8afa82b7a143f40c3d9fb331d10da5bd3a34bc50bef894438f2828",
+    "internal/observability/logging_test.go": "ec1333f4e04c341ef86c28a4f4976db3a4e05957ed11bc1e67cba69cedffc27f",
+    "internal/observability/metrics.go": "5a27c9ae8bf97420bd12d75831e11dbe623426b66471af0ece264a266cadbd19",
+    "internal/observability/metrics_integration_test.go": "edfa16aefda28774824132729c153a13b3cc484966a69edda514a56361305721",
+    "internal/observability/metrics_test.go": "cec4bb25777ddf1e28f7c986b93a81df9689faf22edaa9751d934974da1b5f9c",
+    "internal/observability/monitoring_test.go": "7f76169d37d9833d833a9d7783c2fd431b674234fc04e0a4916add48bf2f306e",
+    "internal/observability/server.go": "8b78dc4ca05c80a4ad397b0e66dadd81356630133c5d430c82d9cb0efef262f7",
+    "internal/registrysecret/builder.go": "e5f276cc56392c614100d4fc546ad069667ea5fa4e21d960f01a3490f140571d",
+    "internal/registrysecret/builder_test.go": "3fb053b192614c4093b97996d77ec77d96b6c95c1d47e76779603957cb19bce5",
+    "internal/registrysecret/inspection.go": "a8f050b0f1b401953b98f6873ecced00d9b8537daab3e891f1db4519876dd2aa",
+    "internal/registrysecret/inspection_test.go": "fb0c1f5b505f870bb95b3a1233da568ed864387d2be2adbffa4b76ed4dc14b64",
+    "internal/registrysecret/syncer.go": "9d03ef07f6782dd5bcf569189b494c41a7e19d3af9a3034e05de61cd15586af3",
+    "internal/registrysecret/syncer_test.go": "df5b9f318cda43be79ead06810013dd529fa4447c151d1b3517703f3a14655b2",
+    "internal/serviceaccount/syncer.go": "897a0bf2575f040b4e0006bbb44513775c798364da9f47f138bdcc90e0183744",
+    "internal/serviceaccount/syncer_test.go": "d043bac29aaf90e9543f98b873ec7567fbec6c6cca3187fb886b0a499e6e44f1"
+  },
+  "environment": {
+    "host": "Mac mini M4",
+    "virtualization": "Lima VZ ARM64",
+    "kubernetes": "K3s v1.36.3+k3s1",
+    "datastore": "SQLite/Kine",
+    "concurrentNamespaceSyncs": 30,
+    "k3sMainPID": 912,
+    "nodes": {
+      "controlPlane": {
+        "vCPU": 2,
+        "memoryGiB": 4
+      },
+      "worker1": {
+        "vCPU": 2,
+        "memoryGiB": 3
+      },
+      "worker2": {
+        "vCPU": 2,
+        "memoryGiB": 3
+      }
+    },
+    "controllerNode": "lima-k8s-worker-1",
+    "controllerLimit": {
+      "cpuMillicores": 1500,
+      "memoryMiB": 1024
+    },
+    "driverQPS": 200,
+    "driverBurst": 400,
+    "driverSetupConcurrency": 25,
+    "provider": "mock",
+    "clock": "mock advanced 50m",
+    "mockTokenTTL": "1h",
+    "refreshBefore": "10m"
+  },
+  "measurement": {
+    "fixedControllerQPS": 100,
+    "fixedControllerBurst": 200,
+    "fixedWorkersPerController": 16,
+    "namespaceCounts": [
+      50,
+      200,
+      1000,
+      2500,
+      5000
+    ],
+    "serviceAccountsPerNamespace": 2,
+    "repeatsPerCount": 3,
+    "namespaceInjectionThresholdPercent": 25,
+    "injectionCondition": "First 10ms polling observation at or above the threshold, before refresh completes; actual progress is recorded.",
+    "newNamespaceClockOrigin": "Host monotonic clock immediately after successful Namespace Create response.",
+    "secretCompletion": "Observer sees the managed Secret with the current refreshed credential fingerprint.",
+    "saCompletion": "Observer sees both default and workload ServiceAccounts referencing the managed Secret.",
+    "mockScope": "Only credential provider and refresh scheduler clock are mocked; Kubernetes API, watches, queues and writes are real.",
+    "runWindowUTC": {
+      "startedAt": "2026-09-06T15:37:23.006243Z",
+      "finishedAt": "2026-09-06T16:18:16.673052Z"
+    },
+    "successfulRuns": 15
+  },
+  "gitBaseCommit": "3d21ca235a8347ea090037a778cf76de5df1f251",
+  "sourceStateAtBuild": "Working tree based on gitBaseCommit, including the perf-driver changes archived with these results. sourceSHA256 identifies the measured files.",
+  "supportingFileSHA256": {
+    "test/performance/run_blog_series.py": "fdaa215b7942e6758e0b6da8a616e1437e0d0df7fe83ef0e52588a4cf68d8720",
+    "test/performance/plot_blog_series.py": "fcd2893b7a37d989f2d8b1fa6129c12287737b90415d53c71b87d011a15abfc3",
+    "test/performance/profiles/component-blog.yaml": "98661af7ea88585dafb7a9438c061b80f7cbae73e12cac1188623c113a73c14c"
+  }
+}

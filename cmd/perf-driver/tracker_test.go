@@ -54,6 +54,32 @@ func TestPercentileInterpolates(t *testing.T) {
 	}
 }
 
+func TestNamespaceOnlyMutationWaitsForBothAccountsAndCurrentSecret(t *testing.T) {
+	tracker := newConvergenceTracker([]string{"ns-a"}, targetServiceAccounts)
+	start := time.Now()
+	current := testSecret("ns-late", "new")
+	mutation := tracker.startConcurrentMutation(25, start, phaseProgress{SecretsComplete: 1, SecretsTotal: 4}, "", "", "ns-late", targetServiceAccounts, secretFingerprint(current))
+	tracker.markLateNamespaceCreated(mutation, start)
+	tracker.markLateNamespacePrerequisitesReady(mutation, start.Add(time.Millisecond))
+	tracker.observeServiceAccount(testServiceAccount("ns-late", "default", "1"), start.Add(2*time.Millisecond))
+	tracker.observeSecret(current, start.Add(3*time.Millisecond))
+	select {
+	case <-mutation.done:
+		t.Fatal("completed before the second account was patched")
+	default:
+	}
+	tracker.observeServiceAccount(testServiceAccount("ns-late", "workload", "2"), start.Add(4*time.Millisecond))
+	select {
+	case <-mutation.done:
+	default:
+		t.Fatal("namespace-only injection waited for a nonexistent third account")
+	}
+	summary := tracker.concurrentMutationSummary(mutation)
+	if !summary.NamespaceOnly || summary.LateNamespace.ObservedPatchedServiceAccounts != 2 || summary.LateNamespace.ServiceAccountsLatencySeconds != .004 {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+}
+
 func TestTrackerRecordsConcurrentMutationReadiness(t *testing.T) {
 	tracker := newConvergenceTracker([]string{"ns-a", "ns-b"}, []string{"default", "workload"})
 	start := time.Date(2026, time.September, 4, 10, 0, 0, 0, time.UTC)

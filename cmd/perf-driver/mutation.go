@@ -45,6 +45,7 @@ type mutationNamespaceSummary struct {
 }
 
 type concurrentMutationSummary struct {
+	NamespaceOnly                 bool                     `json:"namespaceOnly,omitempty"`
 	TriggerPercent                int                      `json:"triggerPercent"`
 	TriggeredAt                   time.Time                `json:"triggeredAt"`
 	SecretsCompleteAtTrigger      int                      `json:"secretsCompleteAtTrigger"`
@@ -95,6 +96,7 @@ func runConcurrentMutation(
 	runID string,
 	triggerPercent int,
 	timeout time.Duration,
+	namespaceOnly bool,
 ) mutationOutcome {
 	mutationCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -114,12 +116,16 @@ func runConcurrentMutation(
 
 	triggeredAt := time.Now()
 	lateNamespace := concurrentNamespaceName(runID)
+	lateAccountName := serviceAccountLate
+	if namespaceOnly {
+		existingNamespace, lateAccountName = "", ""
+	}
 	mutation := tracker.startConcurrentMutation(
 		triggerPercent,
 		triggeredAt,
 		progress,
 		existingNamespace,
-		serviceAccountLate,
+		lateAccountName,
 		lateNamespace,
 		targetServiceAccounts,
 		fingerprint,
@@ -127,10 +133,14 @@ func runConcurrentMutation(
 
 	start := make(chan struct{})
 	creationErrors := make(chan error, 2)
-	go func() {
-		<-start
-		creationErrors <- createLateServiceAccount(mutationCtx, clientset, tracker, mutation, runID)
-	}()
+	creations := 1
+	if !namespaceOnly {
+		creations++
+		go func() {
+			<-start
+			creationErrors <- createLateServiceAccount(mutationCtx, clientset, tracker, mutation, runID)
+		}()
+	}
 	go func() {
 		<-start
 		creationErrors <- createLateNamespace(mutationCtx, clientset, tracker, mutation, runID)
@@ -138,7 +148,7 @@ func runConcurrentMutation(
 	close(start)
 
 	var creationErr error
-	for range 2 {
+	for range creations {
 		creationErr = errors.Join(creationErr, <-creationErrors)
 	}
 	if creationErr != nil {
@@ -250,7 +260,9 @@ func createLateNamespace(
 		return err
 	}
 	for _, name := range targetServiceAccounts {
-		if err := ensureServiceAccount(ctx, clientset, mutation.lateNamespace, name, labels); err != nil {
+		// A fast controller may already have patched the auto-created default
+		// account. Labelling an injected account must not undo that observation.
+		if err := ensureServiceAccount(ctx, clientset, mutation.lateNamespace, name, labels, false); err != nil {
 			return err
 		}
 	}
@@ -263,21 +275,23 @@ func verifyConcurrentMutationFinalState(
 	clientset kubernetes.Interface,
 	summary concurrentMutationSummary,
 ) error {
-	lateAccount, err := clientset.CoreV1().ServiceAccounts(summary.LateServiceAccount.Namespace).Get(
-		ctx,
-		summary.LateServiceAccount.Name,
-		metav1.GetOptions{},
-	)
-	if err != nil {
-		return fmt.Errorf("verify injected ServiceAccount: %w", err)
-	}
-	if !referencesManagedSecret(lateAccount) {
-		return fmt.Errorf(
-			"injected ServiceAccount %s/%s does not reference %s",
-			lateAccount.Namespace,
-			lateAccount.Name,
-			controller.DefaultManagedSecretName,
+	if !summary.NamespaceOnly {
+		lateAccount, err := clientset.CoreV1().ServiceAccounts(summary.LateServiceAccount.Namespace).Get(
+			ctx,
+			summary.LateServiceAccount.Name,
+			metav1.GetOptions{},
 		)
+		if err != nil {
+			return fmt.Errorf("verify injected ServiceAccount: %w", err)
+		}
+		if !referencesManagedSecret(lateAccount) {
+			return fmt.Errorf(
+				"injected ServiceAccount %s/%s does not reference %s",
+				lateAccount.Namespace,
+				lateAccount.Name,
+				controller.DefaultManagedSecretName,
+			)
+		}
 	}
 
 	secret, err := clientset.CoreV1().Secrets(summary.LateNamespace.Name).Get(

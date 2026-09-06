@@ -1,0 +1,150 @@
+{
+  "schemaVersion": 2,
+  "runID": "blog-scale-n1000-r2",
+  "datasetID": "blog-scale-260906",
+  "namespaceCount": 1000,
+  "serviceAccountCount": 2000,
+  "startedAt": "2026-09-06T15:40:58.205518Z",
+  "finishedAt": "2026-09-06T15:42:33.718604Z",
+  "setupSeconds": 54.019729958,
+  "cleanupSeconds": 1.015375292,
+  "initial": {
+    "name": "initial",
+    "startedAt": "2026-09-06T15:41:53.167257Z",
+    "completedAt": "2026-09-06T15:42:22.209662Z",
+    "durationSeconds": 29.042257375,
+    "secretCompletion": {
+      "count": 1000,
+      "p50Seconds": 9.3930088545,
+      "p90Seconds": 17.046695083300005,
+      "p95Seconds": 18.12295926875,
+      "p99Seconds": 18.815740816159998,
+      "maximumSeconds": 19.065521208,
+      "objectsPerSecond": 52.45070350242481
+    },
+    "serviceAccountCompletion": {
+      "count": 2000,
+      "p50Seconds": 19.4077889375,
+      "p90Seconds": 27.114603916700002,
+      "p95Seconds": 28.08010171845,
+      "p99Seconds": 28.86039039042,
+      "maximumSeconds": 29.042257375,
+      "objectsPerSecond": 68.86517029911144
+    },
+    "unexpectedServiceAccountUpdates": 0
+  },
+  "expiry": {
+    "name": "expiry",
+    "startedAt": "2026-09-06T15:42:24.815108Z",
+    "completedAt": "2026-09-06T15:42:32.571986Z",
+    "durationSeconds": 7.756838958,
+    "secretCompletion": {
+      "count": 1000,
+      "p50Seconds": 2.943695625,
+      "p90Seconds": 6.7930183042,
+      "p95Seconds": 7.2766736997,
+      "p99Seconds": 7.65840175175,
+      "maximumSeconds": 7.756838958,
+      "objectsPerSecond": 128.91849442982854
+    },
+    "serviceAccountCompletion": {
+      "count": 0,
+      "p50Seconds": 0,
+      "p90Seconds": 0,
+      "p95Seconds": 0,
+      "p99Seconds": 0,
+      "maximumSeconds": 0,
+      "objectsPerSecond": 0
+    },
+    "unexpectedServiceAccountUpdates": 0
+  },
+  "resources": {
+    "samples": 8,
+    "errors": 0,
+    "controllerPeak": {
+      "cpuMillicores": 61,
+      "memoryMiB": 33.68359375
+    },
+    "nodePeaks": {
+      "lima-k8s-control-plane": {
+        "cpuMillicores": 360,
+        "memoryMiB": 1535.4453125
+      },
+      "lima-k8s-worker-1": {
+        "cpuMillicores": 147,
+        "memoryMiB": 642.74609375
+      },
+      "lima-k8s-worker-2": {
+        "cpuMillicores": 31,
+        "memoryMiB": 509.73046875
+      }
+    }
+  },
+  "diagnostics": {
+    "controllerLogBytes": 4950,
+    "controllerErrorLogLines": 0,
+    "controllerLogComplete": true
+  },
+  "controllerProfile": {
+    "replicas": 1,
+    "image": "docker.io/library/kubernetes-registry-secret-controller:blog-20260906",
+    "arguments": [
+      "--allow-mock-provider",
+      "--leader-elect=true",
+      "--mock-token-ttl=1h",
+      "--credential-refresh-before=10m",
+      "--mock-clock-control-address=:8082",
+      "--kube-api-qps=100",
+      "--kube-api-burst=200",
+      "--max-concurrent-namespace-reconciles=16",
+      "--max-concurrent-service-account-reconciles=16"
+    ],
+    "deploymentGeneration": 25,
+    "observedAt": "2026-09-06T15:40:58.21023Z",
+    "verifiedAt": "2026-09-06T15:42:32.575393Z",
+    "configurationStable": true,
+    "namespaceReconcileConcurrency": 16,
+    "serviceAccountReconcileConcurrency": 16,
+    "restClientRateLimit": "configured QPS 100, burst 200",
+    "tokenTTL": "1h",
+    "refreshBefore": "10m",
+    "expiryTrigger": "fake clock advanced 50m0s; real scheduler and Kubernetes writes"
+  },
+  "concurrentMutation": {
+    "namespaceOnly": true,
+    "triggerPercent": 25,
+    "triggeredAt": "2026-09-06T15:42:25.31672Z",
+    "secretsCompleteAtTrigger": 250,
+    "secretsTotalAtTrigger": 1000,
+    "existingNamespace": "",
+    "expectedCredentialFingerprint": "7d9fd1459b68f7aa7394032f4b820fa5d8bda98ab8bba9f6a94a96e16d0f26ef",
+    "lateServiceAccount": {
+      "namespace": "",
+      "name": "",
+      "createRequestStartedAt": "0001-01-01T00:00:00Z",
+      "createdAt": "0001-01-01T00:00:00Z",
+      "readyAt": "0001-01-01T00:00:00Z",
+      "readyLatencySeconds": 0
+    },
+    "lateNamespace": {
+      "name": "krsc-perf-blog-scale-260906-late",
+      "createRequestStartedAt": "2026-09-06T15:42:25.316732Z",
+      "createdAt": "2026-09-06T15:42:25.319095Z",
+      "prerequisitesReadyAt": "2026-09-06T15:42:25.337733Z",
+      "secretReadyAt": "2026-09-06T15:42:25.475799Z",
+      "serviceAccountsReadyAt": "2026-09-06T15:42:25.649957Z",
+      "readyAt": "2026-09-06T15:42:25.649957Z",
+      "secretLatencySeconds": 0.156703125,
+      "serviceAccountsLatencySeconds": 0.330860209,
+      "readyLatencySeconds": 0.330860209,
+      "prerequisitesToReadySeconds": 0.3122225,
+      "observedCredentialFingerprint": "7d9fd1459b68f7aa7394032f4b820fa5d8bda98ab8bba9f6a94a96e16d0f26ef",
+      "staleCredentialFingerprints": 0,
+      "expectedServiceAccountCount": 2,
+      "observedPatchedServiceAccounts": 2
+    },
+    "success": true
+  },
+  "environmentNote": "Mac mini M4; Lima ARM64; K3s v1.36.3+k3s1 SQLite/Kine; control-plane 2CPU/4GiB, two workers 2CPU/3GiB each; concurrent-namespace-syncs=30; controller pinned to lima-k8s-worker-1; each Namespace has default+workload; only one new Namespace injected at 25% expiry progress; mock TTL 1h, refresh-before 10m, fake clock +50m",
+  "success": true
+}

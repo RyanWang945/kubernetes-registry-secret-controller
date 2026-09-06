@@ -411,10 +411,12 @@ func (t *convergenceTracker) observeMutationServiceAccountLocked(
 }
 
 func (t *convergenceTracker) maybeCompleteMutationLocked(mutation *trackedConcurrentMutation) {
-	if mutation.lateServiceAccountCreatedAt.IsZero() ||
-		mutation.lateNamespaceCreatedAt.IsZero() ||
+	if mutation.lateServiceAccountName != "" &&
+		(mutation.lateServiceAccountCreatedAt.IsZero() || mutation.lateServiceAccountReadyAt.IsZero()) {
+		return
+	}
+	if mutation.lateNamespaceCreatedAt.IsZero() ||
 		mutation.lateNamespacePrerequisitesAt.IsZero() ||
-		mutation.lateServiceAccountReadyAt.IsZero() ||
 		mutation.lateNamespaceSecretReadyAt.IsZero() ||
 		len(mutation.lateNamespaceAccountReadyAt) != len(mutation.lateNamespaceAccounts) {
 		return
@@ -434,6 +436,7 @@ func (t *convergenceTracker) concurrentMutationSummary(
 	}
 	readyAt := laterTime(mutation.lateNamespaceSecretReadyAt, serviceAccountsReadyAt)
 	return concurrentMutationSummary{
+		NamespaceOnly:                 mutation.lateServiceAccountName == "",
 		TriggerPercent:                mutation.triggerPercent,
 		TriggeredAt:                   mutation.triggeredAt.UTC(),
 		SecretsCompleteAtTrigger:      mutation.secretsCompleteAtTrigger,

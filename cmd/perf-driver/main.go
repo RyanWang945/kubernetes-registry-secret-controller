@@ -66,27 +66,28 @@ const (
 var targetServiceAccounts = []string{serviceAccountDefault, serviceAccountWorkload}
 
 type commandOptions struct {
-	kubeconfig         string
-	contextName        string
-	runID              string
-	datasetID          string
-	outputDirectory    string
-	namespaceCount     int
-	setupConcurrency   int
-	clientQPS          float64
-	clientBurst        int
-	initialTimeout     time.Duration
-	expiryTimeout      time.Duration
-	cleanupTimeout     time.Duration
-	clockAdvance       time.Duration
-	cleanupOnly        bool
-	keepResources      bool
-	reuseDataset       bool
-	retainDataset      bool
-	injectDuringExpiry bool
-	injectionPercent   int
-	injectionTimeout   time.Duration
-	environmentNote    string
+	kubeconfig          string
+	contextName         string
+	runID               string
+	datasetID           string
+	outputDirectory     string
+	namespaceCount      int
+	setupConcurrency    int
+	clientQPS           float64
+	clientBurst         int
+	initialTimeout      time.Duration
+	expiryTimeout       time.Duration
+	cleanupTimeout      time.Duration
+	clockAdvance        time.Duration
+	cleanupOnly         bool
+	keepResources       bool
+	reuseDataset        bool
+	retainDataset       bool
+	injectDuringExpiry  bool
+	injectNamespaceOnly bool
+	injectionPercent    int
+	injectionTimeout    time.Duration
+	environmentNote     string
 }
 
 type benchmarkSummary struct {
@@ -200,6 +201,7 @@ func parseOptions(arguments []string) (commandOptions, error) {
 	flags.BoolVar(&options.reuseDataset, "reuse-dataset", false, "reuse and reset an existing dataset, growing it to namespaces if needed")
 	flags.BoolVar(&options.retainDataset, "retain-dataset", false, "scale the controller to zero but retain test namespaces after the benchmark")
 	flags.BoolVar(&options.injectDuringExpiry, "inject-during-expiry", false, "create a target ServiceAccount and Namespace while expiry refresh is in progress")
+	flags.BoolVar(&options.injectNamespaceOnly, "inject-namespace-only", false, "inject only a Namespace with two ServiceAccounts, keeping every Namespace at two accounts; requires --inject-during-expiry")
 	flags.IntVar(&options.injectionPercent, "injection-percent", defaultInjectionPercent, "percentage of existing Secrets refreshed before injecting new resources")
 	flags.DurationVar(&options.injectionTimeout, "injection-timeout", defaultInjectionTimeout, "timeout for injected resources to become usable")
 	flags.StringVar(&options.environmentNote, "environment-note", "", "free-form cluster configuration note stored with the result")
@@ -211,6 +213,9 @@ func parseOptions(arguments []string) (commandOptions, error) {
 	}
 	if options.runID == "" {
 		return commandOptions{}, errors.New("--run-id is required")
+	}
+	if options.injectNamespaceOnly && !options.injectDuringExpiry {
+		return commandOptions{}, errors.New("--inject-namespace-only requires --inject-during-expiry")
 	}
 	if problems := validation.IsDNS1123Label(options.runID); len(problems) > 0 {
 		return commandOptions{}, fmt.Errorf("invalid --run-id %q: %s", options.runID, strings.Join(problems, "; "))
@@ -345,7 +350,9 @@ func runBenchmark(
 	configuredServiceAccounts := append([]string(nil), targetServiceAccounts...)
 	if options.injectDuringExpiry {
 		configuredNamespaces = append(configuredNamespaces, concurrentNamespaceName(options.datasetID))
-		configuredServiceAccounts = append(configuredServiceAccounts, serviceAccountLate)
+		if !options.injectNamespaceOnly {
+			configuredServiceAccounts = append(configuredServiceAccounts, serviceAccountLate)
+		}
 	}
 	setupStarted := time.Now()
 	if err := prepareWorkload(ctx, clientset, options.datasetID, namespaces, options.setupConcurrency); err != nil {
@@ -417,6 +424,7 @@ func runBenchmark(
 				options.datasetID,
 				options.injectionPercent,
 				options.injectionTimeout,
+				options.injectNamespaceOnly,
 			)
 		}()
 	}
@@ -595,7 +603,7 @@ func prepareWorkload(
 			return fmt.Errorf("create Namespace %s: %w", namespace, err)
 		}
 		for _, name := range targetServiceAccounts {
-			if err := ensureServiceAccount(ctx, clientset, namespace, name, labels); err != nil {
+			if err := ensureServiceAccount(ctx, clientset, namespace, name, labels, true); err != nil {
 				return err
 			}
 		}
@@ -662,6 +670,7 @@ func ensureServiceAccount(
 	namespace string,
 	name string,
 	labels map[string]string,
+	resetReference bool,
 ) error {
 	_, err := clientset.CoreV1().ServiceAccounts(namespace).Create(ctx, &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: labels},
@@ -680,7 +689,10 @@ func ensureServiceAccount(
 		if current.Labels == nil {
 			current.Labels = make(map[string]string)
 		}
-		desiredReferences := removeManagedSecretReference(current.ImagePullSecrets)
+		desiredReferences := current.ImagePullSecrets
+		if resetReference {
+			desiredReferences = removeManagedSecretReference(current.ImagePullSecrets)
+		}
 		if current.Labels[performanceRunLabel] == labels[performanceRunLabel] &&
 			reflect.DeepEqual(current.ImagePullSecrets, desiredReferences) {
 			return nil

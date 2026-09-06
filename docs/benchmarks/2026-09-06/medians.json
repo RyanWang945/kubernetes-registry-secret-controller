@@ -1,0 +1,32 @@
+[
+  {
+    "namespaces": 50,
+    "refresh_seconds": 0.043524,
+    "new_secret_ms": 45.782292000000005,
+    "two_sa_patched_ms": 49.145917
+  },
+  {
+    "namespaces": 200,
+    "refresh_seconds": 0.183726209,
+    "new_secret_ms": 129.55391699999998,
+    "two_sa_patched_ms": 133.280334
+  },
+  {
+    "namespaces": 1000,
+    "refresh_seconds": 7.756838958,
+    "new_secret_ms": 156.703125,
+    "two_sa_patched_ms": 328.3225
+  },
+  {
+    "namespaces": 2500,
+    "refresh_seconds": 22.213660875,
+    "new_secret_ms": 158.93275,
+    "two_sa_patched_ms": 332.424792
+  },
+  {
+    "namespaces": 5000,
+    "refresh_seconds": 46.311612584,
+    "new_secret_ms": 156.884625,
+    "two_sa_patched_ms": 330.30525
+  }
+]

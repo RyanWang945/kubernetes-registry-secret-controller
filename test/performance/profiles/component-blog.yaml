@@ -1,0 +1,17 @@
+# Locally measured profile for the 2026-09-06 blog series.
+# This is a benchmark profile, not a change to production defaults.
+spec:
+  template:
+    spec:
+      containers:
+        - name: controller
+          args:
+            - --allow-mock-provider
+            - --leader-elect=true
+            - --mock-token-ttl=1h
+            - --credential-refresh-before=10m
+            - --mock-clock-control-address=:8082
+            - --kube-api-qps=100
+            - --kube-api-burst=200
+            - --max-concurrent-namespace-reconciles=16
+            - --max-concurrent-service-account-reconciles=16
